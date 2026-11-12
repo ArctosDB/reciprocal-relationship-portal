@@ -1,0 +1,2 @@
+app_root: "{{ ansible_facts.user_dir }}/apps/vulpes"
+uv_version: 0.13.8

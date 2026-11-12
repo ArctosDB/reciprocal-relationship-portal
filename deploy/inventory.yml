@@ -1,0 +1,4 @@
+staging:
+  hosts:
+    vulpes_staging:
+      ansible_host: warbler

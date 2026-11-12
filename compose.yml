@@ -1,0 +1,100 @@
+services:
+  nginx:
+    image: nginx:1.31.8-trixie-otel
+    ports:
+      - "127.0.0.1:8080:80"
+    volumes:
+      - ./docker/nginx/nginx.conf:/etc/nginx/nginx.conf:ro
+      - ./docker/ssl/certs:/etc/ssl/certs:ro
+      - ./docker/ssl/private:/etc/ssl/private:ro
+    depends_on:
+      - vulpes
+
+  tunnel:
+    image: cloudflare/cloudflared
+    env_file:
+      - .env
+    command: tunnel run
+    depends_on:
+      - nginx
+
+  vulpes:
+    build: .
+    env_file:
+      - .env
+    volumes:
+      - ./duckdb:/duckdb:ro
+    depends_on:
+      - otel-collector
+      - elasticsearch
+
+  elasticsearch:
+    image: elasticsearch:9.5.5
+    ports:
+      - "127.0.0.1:9200:9200"
+    environment:
+      - discovery.type=single-node
+      - xpack.security.enabled=false
+    volumes:
+      - es-data:/usr/share/elasticsearch/data
+
+  kibana:
+    image: kibana:9.5.5
+    ports:
+      - "127.0.0.1:5601:5601"
+    # volumes:
+    #   - ./docker/kibana.yml:/usr/share/kibana/docker/kibana.yml
+
+  tempo:
+    image: grafana/tempo:3.1.1-amd64
+    command: ["-config.file=/etc/tempo.yml", "-log.level=warn"]
+    volumes:
+      - ./docker/tempo.yml:/etc/tempo.yml:ro
+      - tempo-data:/var/tempo
+
+  loki:
+    image: grafana/loki:3.7.9-amd64
+    command: ["-config.file=/etc/loki/loki.yml", "-log.level=warn"]
+    volumes:
+      - ./docker/loki.yml:/etc/loki/loki.yml:ro
+      - loki-data:/loki
+
+  prometheus:
+    image: prom/prometheus:v3.15.1
+    command: ["--config.file=/etc/prometheus/prometheus.yml", "--web.enable-remote-write-receiver", "--log.level=warn"]
+    volumes:
+      - ./docker/prometheus.yml:/etc/prometheus/prometheus.yml:ro
+      - prometheus-data:/prometheus
+
+  otel-collector:
+    image: otel/opentelemetry-collector-contrib:0.164.0
+    command: ["--config=/etc/otel-collector.yml"]
+    volumes:
+      - ./docker/otel-collector.yml:/etc/otel-collector.yml:ro
+    depends_on:
+      - tempo
+      - loki
+      - prometheus
+
+  grafana:
+    image: grafana/grafana:13.3.1-distroless-slim
+    ports:
+      - "127.0.0.1:3000:3000"
+    environment:
+      - GF_AUTH_ANONYMOUS_ENABLED=true
+      - GF_AUTH_ANONYMOUS_ORG_ROLE=Admin
+      - GF_AUTH_DISABLE_LOGIN_FORM=true
+    volumes:
+      - ./docker/grafana/provisioning:/etc/grafana/provisioning:ro
+      - grafana-data:/var/lib/grafana
+    depends_on:
+      - loki
+      - prometheus
+      - tempo
+
+volumes:
+  es-data:
+  tempo-data:
+  loki-data:
+  prometheus-data:
+  grafana-data:

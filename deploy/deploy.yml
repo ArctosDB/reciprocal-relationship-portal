@@ -1,0 +1,103 @@
+- name: Deploy vulpes (Arctos reciprocal relationship portal) to warbler
+  hosts: staging
+  vars:
+    ref: HEAD
+    uv_release_url: https://github.com/astral-sh/uv/releases/download/{{ uv_version }}
+  tasks:
+    - name: Resolve the commit to deploy
+      ansible.builtin.command: git rev-parse --short "{{ ref }}^{commit}"
+      args:
+        chdir: "{{ playbook_dir }}/.."
+      delegate_to: localhost
+      run_once: true
+      register: commit
+      changed_when: false
+
+    - name: Name the release
+      ansible.builtin.set_fact:
+        release_dir: >-
+          {{ app_root }}/releases/{{ now(utc=true, fmt='%Y%m%d%H%M%S') }}-{{ commit.stdout }}
+
+    - name: Build and upload the release
+      block:
+        - name: Create a local working directory
+          ansible.builtin.tempfile:
+            state: directory
+            suffix: vulpes_deploy
+          delegate_to: localhost
+          run_once: true
+          register: local_tmp
+
+        - name: Archive the commit
+          ansible.builtin.command: >-
+            git archive --format=tar.gz --output "{{ local_tmp.path }}/release.tar.gz"
+            "{{ commit.stdout }}"
+          args:
+            chdir: "{{ playbook_dir }}/.."
+          delegate_to: localhost
+          run_once: true
+          changed_when: true
+
+        - name: Create directories
+          ansible.builtin.file:
+            path: "{{ item }}"
+            state: directory
+            mode: "0755"
+          loop:
+            - "{{ app_root }}/bin"
+            - "{{ app_root }}/releases"
+            - "{{ app_root }}/shared/log"
+            - "{{ app_root }}/shared/static"
+            - "{{ release_dir }}"
+
+        - name: Check the installed uv version
+          ansible.builtin.command: "{{ app_root }}/bin/uv --version"
+          register: uv_installed
+          failed_when: false
+          changed_when: false
+
+        # Downloaded locally and uploaded so the server doesn't need access to GitHub
+        - name: Install uv
+          when: uv_version not in uv_installed.stdout
+          block:
+            - name: Download uv
+              ansible.builtin.get_url:
+                url: "{{ uv_release_url }}/uv-{{ ansible_facts.architecture }}-unknown-linux-gnu.tar.gz"
+                dest: "{{ local_tmp.path }}/uv.tar.gz"
+                mode: "0644"
+              delegate_to: localhost
+
+            - name: Upload uv
+              ansible.builtin.unarchive:
+                src: "{{ local_tmp.path }}/uv.tar.gz"
+                dest: "{{ app_root }}/bin"
+                extra_opts:
+                  - --strip-components=1
+
+        - name: Upload the release
+          ansible.builtin.unarchive:
+            src: "{{ local_tmp.path }}/release.tar.gz"
+            dest: "{{ release_dir }}"
+      always:
+        - name: Remove the local working directory
+          ansible.builtin.file:
+            path: "{{ local_tmp.path }}"
+            state: absent
+          delegate_to: localhost
+          run_once: true
+          when: local_tmp.path is defined
+
+    - name: Install dependencies
+      ansible.builtin.command: "{{ app_root }}/bin/uv sync --locked --no-dev"
+      args:
+        chdir: "{{ release_dir }}"
+      environment:
+        UV_PYTHON: /usr/bin/python3
+        UV_PYTHON_DOWNLOADS: never
+      changed_when: true
+
+    - name: Write settings
+      ansible.builtin.template:
+        src: env.j2
+        dest: "{{ app_root }}/shared/env"
+        mode: "0600"
