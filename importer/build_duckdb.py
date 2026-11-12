@@ -1,13 +1,91 @@
 # pyright: ignore
 # pylint: disable=all
 
+"""
+Build data/arctos.duckdb from the filtered flat Arctos export, laid out for the
+search portal: filter by collection / attribute / part / relationship, return
+summary stats and a ~250-row sample fast, then download the full result.
+
+    python importer/build_duckdb.py data/filtered_flat-XXXX.csv
+
+Output paths are anchored to the repo's data/ directory, so the script
+behaves the same from any working directory.
+
+Converts the CSV to data/arctos.parquet once (skipped when the parquet is
+newer), then builds every table in TABLES into data/arctos.duckdb (~4 min,
+12 GB memory limit). Every layout decision below was measured on
+representative portal queries (median of 5, DuckDB 2.0.0, i7-11700K, warm
+cache). Times are DuckDB's own query time unless marked
+"wall", which adds converting the rows to Python tuples.
+
+Layout decisions and why
+------------------------
+One sort order per table, chosen for row-group pruning. DuckDB keeps min/max
+    per column per row group (122,880 rows), so an equality filter on the sort
+    column skips most of the table. records is sorted by (guid_prefix, guid):
+    a collection filter reads 3 of 48 row groups. Child tables sort by their
+    search columns (attributes and part_attributes by type, value). Lookups by
+    scattered ids are not cheap on any table, by design: see "No ART indexes".
+
+Denormalized columns:
+    part_attributes.part_name: a part-attribute search otherwise joined the
+        8M-row parts table only to get the name (75k matching records in one
+        collection: 1094 -> 974 ms wall, the rest being row conversion).
+    taxa.epithet, taxa.family: the synonym heuristic (same epithet and family,
+        different genus) recomputed them from the ctrms struct list on every
+        call (61 -> 11 ms).
+    related_records.dst_id, dst_prefix: resolved at build so relation queries
+        never match on guid strings.
+
+No ART indexes. Tested on records(collection_object_id) and attributes(id):
+    DuckDB has no index join, so joins never use them; an index scan of 250
+    wide records took 120 ms against 58 ms for a plain semi join, a single-row
+    fetch 4 ms, and rebuilding one record's attribute JSON moved 9 -> 8 ms.
+    Together they added 0.6 GB. Narrow id scans are already cheap on the 2.0
+    format (11M ids in ~15 ms).
+
+Default row groups. A copy with 20,480-row groups was equal or slower on
+    every query (hosts of a collection with their parasite guids: 98 -> 130 ms;
+    hosts with an endoparasite detected: 167 -> 281 ms).
+
+Precached collection lists do not help on 2.0. The idea: a summary of which
+    guid_prefix values hold a given species / attribute / relationship target,
+    passed into the query as a constant so the records scan skips other
+    collections. Row groups are indeed skipped (46 -> 21 for a species, 50 -> 9
+    for an attribute value) but engine time is equal or worse, because the
+    scan already decodes wide columns only for vectors that pass the first
+    filter and the extra string filter costs more than the skipped groups:
+    all columns by species 131 -> 309 ms, all columns by attribute value
+    103 -> 122 ms, full parasite download for a host collection 67 -> 121 ms.
+    The 15x once seen on 1.5.6 came from replacing a join on (guid_prefix, id)
+    by a join on id alone (1297 -> 67 ms here), not from the prefix list, so
+    the relationship_prefixes table was removed. Such summaries could still
+    serve as facet counts for the portal's summary panel (per attribute value
+    and collection ~1M rows, per species and collection ~200k).
+
+Not denormalized: the parasite's current scientific_name onto related_records.
+    It removed a records lookup from the host/parasite pair listings but that
+    lookup scans two narrow columns and the change stayed inside noise.
+
+Engine time is 15-130 ms per representative query after all this. What
+    remains on wide results is moving rows out: 75k records x 102 columns is
+    ~120 ms in DuckDB, 900 ms with fetchall(), 320 ms with COPY (...) TO csv,
+    230 ms with to_arrow_table(). Selecting 12 display columns instead of all
+    98 cuts both engine and conversion time about 5x. So: live search should
+    select display columns only (a 250-row sample at 12 columns is ~20 ms,
+    counts and id lists 6-8 ms) and the download should COPY TO.
+"""
+
 import os
 import sys
 import duckdb
 from datetime import datetime
+from pathlib import Path
 
 
-PARQUET = "data/arctos.parquet"
+DATA = Path(__file__).resolve().parent.parent / "data"
+PARQUET = DATA / "arctos.parquet"
+DB = DATA / "arctos.duckdb"
 SRC = f"read_parquet('{PARQUET}')"
 
 JSON_COLS = [
@@ -193,7 +271,7 @@ TABLES = {
             i.scientific_name,
             i.taxa_formula,
             i.made_date,
-            list_transform(i.identification_agents, a -> {
+            list_transform(i.identification_agents, lambda a: {
                 'agent_id': url_id(coalesce(a.agent.agentID, a.agentID)),
                 'agent_name': coalesce(a.agent.agent_name, a.agent_name),
                 'identifier_order': a.identifier_order
@@ -227,24 +305,30 @@ TABLES = {
         ORDER BY taxon_key
     """,
 
+    # epithet (binomials only) and family are precomputed for the synonym heuristic
     "taxa": r"""
-        SELECT
-            coalesce(t.taxon.classification_id, t.taxon_id) AS taxon_key,
-            any_value(t.taxon_id) AS taxon_id,
-            any_value(t.taxon.name) AS name,
-            any_value(t.taxon.source) AS source,
-            any_value(t.taxon.ftn) AS full_taxon_name,
-            any_value(t.taxon.ctrms) AS ctrms,
-            any_value(t.taxon.nctrms) AS nctrms
+        SELECT *,
+            CASE WHEN name LIKE '% %' AND name NOT LIKE '% % %' THEN split_part(name, ' ', 2) END AS epithet,
+            list_filter(ctrms, lambda x: x.typ = 'family')[1].term AS family
         FROM (
-            SELECT unnest(i.identification_taxa) AS t
+            SELECT
+                coalesce(t.taxon.classification_id, t.taxon_id) AS taxon_key,
+                any_value(t.taxon_id) AS taxon_id,
+                any_value(t.taxon.name) AS name,
+                any_value(t.taxon.source) AS source,
+                any_value(t.taxon.ftn) AS full_taxon_name,
+                any_value(t.taxon.ctrms) AS ctrms,
+                any_value(t.taxon.nctrms) AS nctrms
             FROM (
-                SELECT unnest(from_json(previousidentifications, '[{"identification_taxa":[{"taxon_id":"VARCHAR","taxon":{"classification_id":"VARCHAR","name":"VARCHAR","source":"VARCHAR","ftn":"VARCHAR","ctrms":[{"psn":"BIGINT","typ":"VARCHAR","term":"VARCHAR"}],"nctrms":[{"typ":"VARCHAR","term":"VARCHAR"}]}}]}]')) AS i
-                FROM src
-                WHERE previousidentifications IS NOT NULL
+                SELECT unnest(i.identification_taxa) AS t
+                FROM (
+                    SELECT unnest(from_json(previousidentifications, '[{"identification_taxa":[{"taxon_id":"VARCHAR","taxon":{"classification_id":"VARCHAR","name":"VARCHAR","source":"VARCHAR","ftn":"VARCHAR","ctrms":[{"psn":"BIGINT","typ":"VARCHAR","term":"VARCHAR"}],"nctrms":[{"typ":"VARCHAR","term":"VARCHAR"}]}}]}]')) AS i
+                    FROM src
+                    WHERE previousidentifications IS NOT NULL
+                )
             )
+            GROUP BY 1
         )
-        GROUP BY 1
         ORDER BY name
     """,
 
@@ -271,10 +355,12 @@ TABLES = {
         ORDER BY p.part_name
     """,
 
+    # part_name is copied in so part searches never have to join the 8M-row parts table
     "part_attributes": r"""
         SELECT
             id,
             part_id,
+            part_name,
             a.attribute_type,
             a.attribute_value,
             a.attribute_units,
@@ -288,7 +374,7 @@ TABLES = {
                 WHEN 'VARCHAR' THEN a.attribute_determiner->>'$'
             END AS determiner_name
         FROM (
-            SELECT id, url_id(p.partID) AS part_id, unnest(p.part_attributes) AS a
+            SELECT id, url_id(p.partID) AS part_id, p.part_name, unnest(p.part_attributes) AS a
             FROM _parts_raw
         )
         ORDER BY a.attribute_type, a.attribute_value
@@ -532,24 +618,16 @@ def build_database(cursor):
     """)
 
 
-def run(name, cursor, query, params):
-    start = datetime.now()
-    cursor.execute(query, params)
-    stop = datetime.now()
-
-    print(cursor.execute(f"EXPLAIN ANALYZE {query}", params).fetchall()[0][1])
-    print(f"{name} took {(stop - start).total_seconds() * 1000} ms")
-
-
 if __name__ == "__main__":
     if len(sys.argv) != 2:
-        sys.exit("usage: python build_parquet.py <filtered_flat-XXXX.csv>")
+        sys.exit("usage: python importer/build_duckdb.py <filtered_flat-XXXX.csv>")
     csv = sys.argv[1]
+    DATA.mkdir(exist_ok=True)
     if not os.path.exists(PARQUET) or os.path.getmtime(PARQUET) < os.path.getmtime(csv):
-        print(f"converting {csv} -> {PARQUET}", flush=True)
+        print(f"converting {csv} to {PARQUET}", flush=True)
         convert_csv(csv)
 
-    d = duckdb.connect("arctos.duckdb", config={
+    d = duckdb.connect(str(DB), config={
         "memory_limit": "12GB",
         "preserve_insertion_order": False,
     })
