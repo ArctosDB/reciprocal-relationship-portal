@@ -6,17 +6,16 @@ Build data/arctos.duckdb from the filtered flat Arctos export, laid out for the
 search portal: filter by collection / attribute / part / relationship, return
 summary stats and a ~250-row sample fast, then download the full result.
 
-    python importer/build_duckdb.py data/filtered_flat-XXXX.csv
+    python importer/build_duckdb.py data/filtered_flat-XXXX.csv [--out-dir DIR]
 
-Output paths are anchored to the repo's data/ directory, so the script
-behaves the same from any working directory.
-
-Converts the CSV to data/arctos.parquet once (skipped when the parquet is
-newer), then builds every table in TABLES into data/arctos.duckdb (~4 min,
-12 GB memory limit). Every layout decision below was measured on
-representative portal queries (median of 5, DuckDB 2.0.0, i7-11700K, warm
-cache). Times are DuckDB's own query time unless marked
-"wall", which adds converting the rows to Python tuples.
+Outputs go to --out-dir (default: the repo's data/ directory, whatever the
+working directory). Converts the CSV to arctos.parquet once (skipped when the
+parquet is newer), then builds every table in TABLES into arctos.duckdb.new
+and renames it over arctos.duckdb, so a running app never sees a partial
+build (~4 min at 12 GB; the 6 GB MEMORY_LIMIT makes it slower). Every
+layout decision below was measured on representative portal queries (median
+of 5, DuckDB 2.0.0, i7-11700K, warm cache). Times are DuckDB's own query time
+unless marked "wall", which adds converting the rows to Python tuples.
 
 Layout decisions and why
 ------------------------
@@ -76,17 +75,16 @@ Engine time is 15-130 ms per representative query after all this. What
     counts and id lists 6-8 ms) and the download should COPY TO.
 """
 
+import argparse
 import os
-import sys
 import duckdb
 from datetime import datetime
 from pathlib import Path
 
 
-DATA = Path(__file__).resolve().parent.parent / "data"
-PARQUET = DATA / "arctos.parquet"
-DB = DATA / "arctos.duckdb"
-SRC = f"read_parquet('{PARQUET}')"
+DEFAULT_DATA = Path(__file__).resolve().parent.parent / "data"
+# DuckDB buffer pool only; leaves headroom for Python and the CSV reader in the server's 10 GiB
+MEMORY_LIMIT = "6GB"
 
 JSON_COLS = [
     "partdetail",
@@ -568,11 +566,12 @@ TABLES = {
 }
 
 
-def convert_csv(csv):
+def convert_csv(csv, parquet, temp_dir):
     d = duckdb.connect(config={
         "threads": 2,
         "preserve_insertion_order": True,
-        "memory_limit": "16GB",
+        "memory_limit": MEMORY_LIMIT,
+        "temp_directory": str(temp_dir),
     })
 
     with d.cursor() as cursor:
@@ -585,7 +584,7 @@ def convert_csv(csv):
                     store_rejects=true)
                 ORDER BY guid_prefix, guid
             )
-            TO '{PARQUET}' (
+            TO '{parquet}' (
                 FORMAT parquet, COMPRESSION snappy
             )
         """)
@@ -595,8 +594,8 @@ def convert_csv(csv):
         print(f"rejected rows: {rejected}")
 
 
-def build_database(cursor):
-    cursor.execute(f"CREATE OR REPLACE TEMP VIEW src AS SELECT * FROM {SRC}")
+def build_database(cursor, parquet):
+    cursor.execute(f"CREATE OR REPLACE TEMP VIEW src AS SELECT * FROM read_parquet('{parquet}')")
     # trailing number of an Arctos URL: .../agent/123, .../IID123, .../PID123, .../media/123
     cursor.execute(r"CREATE OR REPLACE TEMP MACRO url_id(u) AS TRY_CAST(regexp_extract(u, '(\d+)$', 1) AS BIGINT)")
 
@@ -618,19 +617,40 @@ def build_database(cursor):
     """)
 
 
-if __name__ == "__main__":
-    if len(sys.argv) != 2:
-        sys.exit("usage: python importer/build_duckdb.py <filtered_flat-XXXX.csv>")
-    csv = sys.argv[1]
-    DATA.mkdir(exist_ok=True)
-    if not os.path.exists(PARQUET) or os.path.getmtime(PARQUET) < os.path.getmtime(csv):
-        print(f"converting {csv} to {PARQUET}", flush=True)
-        convert_csv(csv)
+def main():
+    parser = argparse.ArgumentParser(description="Build arctos.duckdb from the flat Arctos CSV export.")
+    parser.add_argument("csv", type=Path, help="filtered_flat-XXXX.csv")
+    parser.add_argument(
+        "--out-dir", type=Path, default=DEFAULT_DATA,
+        help="where arctos.parquet and arctos.duckdb go (default: the repo's data/)")
+    args = parser.parse_args()
 
-    d = duckdb.connect(str(DB), config={
-        "memory_limit": "12GB",
+    out = args.out_dir.resolve()
+    out.mkdir(parents=True, exist_ok=True)
+    parquet = out / "arctos.parquet"
+    db = out / "arctos.duckdb"
+    new = out / "arctos.duckdb.new"
+    # spill files; DuckDB otherwise puts them in the working directory (conversion) or next to the db
+    tmp = out / "duckdb_tmp"
+
+    if not parquet.exists() or parquet.stat().st_mtime < args.csv.stat().st_mtime:
+        print(f"converting {args.csv} to {parquet}", flush=True)
+        convert_csv(args.csv, parquet, tmp)
+
+    # Build into a fresh file and swap it in at the end. An app with the old database open keeps
+    # reading it until it reopens the file, and nothing ever sees a half-built database.
+    new.unlink(missing_ok=True)
+    new.with_name(new.name + ".wal").unlink(missing_ok=True)
+    with duckdb.connect(str(new), config={
+        "memory_limit": MEMORY_LIMIT,
         "preserve_insertion_order": False,
-    })
+        "temp_directory": str(tmp),
+    }) as d:
+        build_database(d, parquet)
+        d.execute("CHECKPOINT")
+    os.replace(new, db)
+    print(f"wrote {db}")
 
-    with d.cursor() as cursor:
-        build_database(cursor)
+
+if __name__ == "__main__":
+    main()
