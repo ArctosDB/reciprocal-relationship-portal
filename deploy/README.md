@@ -5,7 +5,7 @@ the service to staging (warbler). To deploy, run:
 
 ```sh
 cd deploy
-uv run ansible-playbook deploy.yml [-e ref=<commit, tag, or branch>]
+uv run ansible-playbook deploy.yml
 ```
 
 If Ansible does not detect `ansible.cfg`, run:
