@@ -103,8 +103,33 @@
         dest: "{{ app_root }}/shared/env"
         mode: "0600"
 
+    - name: Write secrets
+      ansible.builtin.template:
+        src: secrets.env.j2
+        dest: "{{ app_root }}/shared/secrets.env"
+        mode: "0600"
+
     - name: Write setup script
       ansible.builtin.template:
         src: vulpes.sh.j2
         dest: "{{ app_root }}/vulpes.sh"
         mode: "0755"
+
+    - name: Point current at the new release
+      ansible.builtin.file:
+        src: "{{ release_dir }}"
+        dest: "{{ app_root }}/current"
+        state: link
+        force: true
+
+    - name: Find releases
+      ansible.builtin.find:
+        paths: "{{ app_root }}/releases"
+        file_type: directory
+      register: releases
+
+    - name: Remove old releases
+      ansible.builtin.file:
+        path: "{{ item }}"
+        state: absent
+      loop: "{{ (releases.files | map(attribute='path') | sort)[:-(keep_releases | int)] }}"
