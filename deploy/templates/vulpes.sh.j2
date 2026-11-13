@@ -39,6 +39,8 @@ start() {
         --port {{ uvicorn_port }} \
         --workers {{ uvicorn_workers }} \
         --root-path {{ root_path }} \
+        --proxy-headers \
+        --forwarded-allow-ips '*' \
         --timeout-graceful-shutdown 30 \
         --log-config vulpes/config/logging.json \
         >> "$LOG_DIR/vulpes.log" 2>&1 < /dev/null &
