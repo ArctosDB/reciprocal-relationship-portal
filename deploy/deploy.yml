@@ -46,6 +46,7 @@
           loop:
             - "{{ app_root }}/bin"
             - "{{ app_root }}/releases"
+            - "{{ app_root }}/shared/data"
             - "{{ app_root }}/shared/log"
             - "{{ app_root }}/shared/static"
             - "{{ release_dir }}"
