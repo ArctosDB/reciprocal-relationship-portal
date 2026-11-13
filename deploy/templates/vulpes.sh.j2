@@ -1,0 +1,89 @@
+#! /usr/bin/env bash
+#
+# Managed by Ansible (deploy/templates/vulpes.sh.j2); local edits will be overwritten.
+#
+# Runs the app with the release's own uvicorn (from its virtualenv), with production
+# settings from shared/env and shared/secrets.env.
+#
+# Usage:
+#   vulpes.sh start|stop|restart|status
+#
+# Acts on the release that "current" points to, unless RELEASE_DIR is set.
+
+set -euo pipefail
+
+APP_ROOT={{ app_root }}
+RELEASE_DIR=$(readlink -f "${RELEASE_DIR:-$APP_ROOT/current}")
+PIDFILE=$APP_ROOT/shared/uvicorn.pid
+LOG_DIR=$APP_ROOT/shared/log
+
+set -a
+. "$APP_ROOT/shared/env"
+. "$APP_ROOT/shared/secrets.env"
+set +a
+
+is_running() {
+    [[ -f $PIDFILE ]] && ps -p "$(cat "$PIDFILE")" -o args= 2>/dev/null | grep -q uvicorn
+}
+
+start() {
+    if is_running; then
+        echo "already running (pid $(cat "$PIDFILE"))"
+        return
+    fi
+    cd "$RELEASE_DIR"
+    # uvicorn can't daemonize itself, so detach it from this shell with setsid/nohup.
+    # Logging goes to stdout via logging.json, so the access and app logs share one file.
+    setsid nohup "$RELEASE_DIR/.venv/bin/uvicorn" vulpes.main:app \
+        --host {{ uvicorn_host }} \
+        --port {{ uvicorn_port }} \
+        --workers {{ uvicorn_workers }} \
+        --root-path {{ root_path }} \
+        --timeout-graceful-shutdown 30 \
+        --log-config vulpes/config/logging.json \
+        >> "$LOG_DIR/vulpes.log" 2>&1 < /dev/null &
+    echo $! > "$PIDFILE"
+    # Import errors only show up once the app loads, so give it a moment to fail
+    sleep 2
+    if ! is_running; then
+        rm -f "$PIDFILE"
+        echo "uvicorn failed to start; see $LOG_DIR/vulpes.log" >&2
+        exit 1
+    fi
+    echo "started (pid $(cat "$PIDFILE")) from $RELEASE_DIR"
+}
+
+stop() {
+    if ! is_running; then
+        echo "not running"
+        return
+    fi
+    local pid
+    pid=$(cat "$PIDFILE")
+    # TERM is a graceful shutdown; workers get 30s (--timeout-graceful-shutdown) to finish requests
+    kill -TERM "$pid"
+    for _ in $(seq 40); do
+        if ! kill -0 "$pid" 2>/dev/null; then
+            rm -f "$PIDFILE"
+            echo "stopped"
+            return
+        fi
+        sleep 1
+    done
+    echo "uvicorn (pid $pid) did not stop" >&2
+    exit 1
+}
+
+# TODO case for rebuilding duckdb database from a flat export
+case "${1:-}" in
+    start) start ;;
+    stop) stop ;;
+    restart) stop; start ;;
+    status)
+        if is_running; then echo "running (pid $(cat "$PIDFILE"))"; else echo "not running"; fi
+        ;;
+    *)
+        echo "usage: $0 start|stop|restart|status" >&2
+        exit 2
+        ;;
+esac

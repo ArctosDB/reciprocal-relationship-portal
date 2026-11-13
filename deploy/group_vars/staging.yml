@@ -1,2 +1,6 @@
 app_root: "{{ ansible_facts.user_dir }}/apps/vulpes"
 uv_version: 0.13.8
+uvicorn_host: 0.0.0.0
+uvicorn_port: 8002
+uvicorn_workers: 2
+root_path: /arctos-reciprocal-relationship-portal

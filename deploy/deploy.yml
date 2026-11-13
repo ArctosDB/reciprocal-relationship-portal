@@ -102,3 +102,9 @@
         src: env.j2
         dest: "{{ app_root }}/shared/env"
         mode: "0600"
+
+    - name: Write setup script
+      ansible.builtin.template:
+        src: vulpes.sh.j2
+        dest: "{{ app_root }}/vulpes.sh"
+        mode: "0755"
