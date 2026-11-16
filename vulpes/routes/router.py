@@ -1,7 +1,8 @@
+import gzip
 from pathlib import Path
 from typing import Annotated
 
-from fastapi import APIRouter, Query, Response
+from fastapi import APIRouter, Query, Request, Response
 from opentelemetry import trace
 
 from vulpes.engines.abc import CSVStreamingResponse, QueryEngine
@@ -12,6 +13,12 @@ tracer = trace.get_tracer(__name__)
 
 MAPPER_CONFIG = (Path(__file__).parent.parent / "config" / "berkeleymapper.xml").read_bytes()
 
+# Nothing an engine answers changes until the service restarts on a new
+# snapshot, so a browser may reuse an answer instead of asking again. The
+# portal asks for the same search again on every tab switch.
+SEARCH_CACHE = "public, max-age=300"
+SCHEMA_CACHE = "public, max-age=900"
+
 
 def make_router(engine: QueryEngine) -> APIRouter:
     """
@@ -19,7 +26,11 @@ def make_router(engine: QueryEngine) -> APIRouter:
     """
     router = APIRouter()
 
-    # The portal still asks for the export under the name the old service gave it.
+    # The schema is fixed for the life of the process and large, so it is
+    # written and compressed once here, not on every request (60 ms each).
+    schema_json = engine.schema().model_dump_json().encode()
+    schema_gzip = gzip.compress(schema_json)
+
     @router.get("/download", response_class=CSVStreamingResponse)
     def download(query: Annotated[ArctosQuery, Query()]) -> CSVStreamingResponse:
         with tracer.start_as_current_span(f"{engine.name}.download"):
@@ -31,24 +42,33 @@ def make_router(engine: QueryEngine) -> APIRouter:
         return Response(MAPPER_CONFIG, media_type="application/xml", headers={"Cache-Control": "public, max-age=3600"})
 
     @router.get("/relations")
-    def relations(query: Annotated[ArctosQuery, Query()]) -> SearchResults:
+    def relations(response: Response, query: Annotated[ArctosQuery, Query()]) -> SearchResults:
+        response.headers["Cache-Control"] = SEARCH_CACHE
         with tracer.start_as_current_span(f"{engine.name}.relations"):
             return engine.relations(query)
 
-    @router.get("/schema")
-    def schema() -> Schema:
-        with tracer.start_as_current_span(f"{engine.name}.schema"):
-            return engine.schema()
+    @router.get("/schema", response_model=Schema)
+    def schema(request: Request) -> Response:
+        # `Vary` keeps a shared cache from handing the compressed bytes to a
+        # client that did not ask for them.
+        headers = {"Cache-Control": SCHEMA_CACHE, "Vary": "Accept-Encoding"}
+        body = schema_json
+        if "gzip" in request.headers.get("Accept-Encoding", ""):
+            headers["Content-Encoding"] = "gzip"
+            body = schema_gzip
+        return Response(body, media_type="application/json", headers=headers)
 
     @router.get("/search")
-    def search(query: Annotated[ArctosQuery, Query()]) -> SearchResults:
+    def search(response: Response, query: Annotated[ArctosQuery, Query()]) -> SearchResults:
+        response.headers["Cache-Control"] = SEARCH_CACHE
         # To record a request detail on the trace, set an attribute on
         # opentelemetry's current span here, for example `arctos.page`.
         with tracer.start_as_current_span(f"{engine.name}.search"):
             return engine.search(query)
 
     @router.get("/summary")
-    def summary(query: Annotated[ArctosQuery, Query()]) -> SearchSummary:
+    def summary(response: Response, query: Annotated[ArctosQuery, Query()]) -> SearchSummary:
+        response.headers["Cache-Control"] = SEARCH_CACHE
         with tracer.start_as_current_span(f"{engine.name}.summary"):
             return engine.summary(query)
 

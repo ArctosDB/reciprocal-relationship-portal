@@ -192,6 +192,33 @@ def test_an_export_past_the_cap_is_refused_whole(
         engine.download(ArctosQuery(cols="guid,nope"))
 
 
+# ---- caching --------------------------------------------------------------
+
+
+def test_answers_are_cacheable_until_the_next_snapshot(client: TestClient) -> None:
+    assert client.get("/schema").headers["cache-control"] == "public, max-age=900"
+    assert client.get("/taxa", params={"q": "so"}).headers["cache-control"] == "public, max-age=3600"
+    assert client.get("/berkeleymapper.xml").headers["cache-control"] == "public, max-age=3600"
+    # The portal asks for the same search again on every tab switch.
+    for path in ("/search", "/summary", "/relations"):
+        assert client.get(path, params={"taxon": "genus|Sorex"}).headers["cache-control"] == "public, max-age=300"
+    # An error is not an answer worth keeping.
+    assert "cache-control" not in client.get("/search", params={"page": "0"}).headers
+
+
+def test_the_schema_is_the_same_document_compressed_or_not(client: TestClient, engine: DuckDbQueryEngine) -> None:
+    expected = json.loads(engine.schema().model_dump_json())
+    packed = client.get("/schema", headers={"Accept-Encoding": "gzip"})
+    assert packed.headers["content-encoding"] == "gzip"
+    assert packed.json() == expected
+    plain = client.get("/schema", headers={"Accept-Encoding": "identity"})
+    assert "content-encoding" not in plain.headers
+    assert plain.json() == expected
+    assert packed.headers["vary"] == plain.headers["vary"] == "Accept-Encoding"
+    # The route still documents the shape it returns.
+    assert "Schema" in client.get("/openapi.json").text
+
+
 # ---- /berkeleymapper.xml --------------------------------------------------
 
 
