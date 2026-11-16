@@ -17,6 +17,8 @@ warn_required_dynamic_aliases = true
 
 [tool.ruff]
 line-length = 127
+# a standalone build script and its tests, not part of the service
+extend-exclude = ["importer"]
 
 [tool.ruff.lint]
 select = ["ALL"]

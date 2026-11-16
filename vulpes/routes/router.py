@@ -1,0 +1,58 @@
+from typing import Annotated
+
+from fastapi import APIRouter, Query, Response
+from opentelemetry import trace
+
+from vulpes.engines.abc import CSVStreamingResponse, QueryEngine
+from vulpes.models.query import ArctosQuery
+from vulpes.models.responses import Schema, SearchResults, SearchSummary, TaxaResults
+
+tracer = trace.get_tracer(__name__)
+
+
+def make_router(engine: QueryEngine) -> APIRouter:
+    """
+    Factory for making a router that relies on one search engine
+    """
+    router = APIRouter()
+
+    @router.get("/download", response_class=CSVStreamingResponse)
+    def download(query: Annotated[ArctosQuery, Query()]) -> CSVStreamingResponse:
+        with tracer.start_as_current_span(f"{engine.name}.download"):
+            return engine.download(query)
+
+    @router.get("/relations")
+    def relations(query: Annotated[ArctosQuery, Query()]) -> SearchResults:
+        with tracer.start_as_current_span(f"{engine.name}.relations"):
+            return engine.relations(query)
+
+    @router.get("/schema")
+    def schema() -> Schema:
+        with tracer.start_as_current_span(f"{engine.name}.schema"):
+            return engine.schema()
+
+    @router.get("/search")
+    def search(query: Annotated[ArctosQuery, Query()]) -> SearchResults:
+        # To record a request detail on the trace, set an attribute on
+        # opentelemetry's current span here, for example `arctos.page`.
+        with tracer.start_as_current_span(f"{engine.name}.search"):
+            return engine.search(query)
+
+    @router.get("/summary")
+    def summary(query: Annotated[ArctosQuery, Query()]) -> SearchSummary:
+        with tracer.start_as_current_span(f"{engine.name}.summary"):
+            return engine.summary(query)
+
+    @router.get("/taxa")
+    def taxa(
+        response: Response,
+        q: Annotated[str, Query(description="The start of a taxon name, at least two characters.")],
+        rank: Annotated[str | None, Query(description="A rank id of the schema, to keep that rank's names.")] = None,
+        limit: Annotated[int, Query(ge=1, le=20)] = 10,
+    ) -> TaxaResults:
+        # The names change only with the snapshot, and the form asks on every keystroke.
+        response.headers["Cache-Control"] = "public, max-age=3600"
+        with tracer.start_as_current_span(f"{engine.name}.taxa"):
+            return TaxaResults(matches=engine.taxa(q, rank, limit))
+
+    return router

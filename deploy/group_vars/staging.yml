@@ -1,5 +1,6 @@
 app_root: "{{ ansible_facts.user_dir }}/apps/vulpes"
 duckdb_path: "{{ ansible_facts.user_dir }}/apps/vulpes/shared/data/arctos.duckdb"
+codetables_path: "{{ ansible_facts.user_dir }}/apps/vulpes/shared/data/code-tables/"
 
 uv_version: 0.13.8
 uvicorn_host: 0.0.0.0

@@ -6,7 +6,11 @@ Build data/arctos.duckdb from the filtered flat Arctos export, laid out for the
 search portal: filter by collection / attribute / part / relationship, return
 summary stats and a ~250-row sample fast, then download the full result.
 
-    python importer/build_duckdb.py data/filtered_flat-XXXX.csv [--out-dir DIR]
+    python importer/build_duckdb.py data/filtered_flat-YYYY_D_M.csv [--out-dir DIR] [--snapshot-date YYYY-MM-DD]
+
+The day of the flat export is stored in the `snapshot` table, which the service
+reports as the date its data is current as of. It is read from the CSV's name
+(year_day_month, as Arctos names the export) unless --snapshot-date gives it.
 
 Outputs go to --out-dir (default: the repo's data/ directory, whatever the
 working directory). Converts the CSV to arctos.parquet once (skipped when the
@@ -77,8 +81,9 @@ Engine time is 15-130 ms per representative query after all this. What
 
 import argparse
 import os
+import re
 import duckdb
-from datetime import datetime
+from datetime import date, datetime
 from pathlib import Path
 
 
@@ -160,7 +165,6 @@ TABLES = {
         FROM src
         ORDER BY guid_prefix, guid
     """,
-
     "collections": r"""
         SELECT
             guid_prefix,
@@ -171,7 +175,6 @@ TABLES = {
         FROM src
         GROUP BY guid_prefix
     """,
-
     "localities": r"""
         WITH ev AS (
             SELECT unnest(from_json(json_locality, '[{"locality_id":"BIGINT","spec_locality":"VARCHAR","higher_geog":"VARCHAR","geog_auth_rec_id":"BIGINT","locality_name":"VARCHAR","locality_remarks":"VARCHAR","coordinates":"VARCHAR","datum":"VARCHAR","coordinate_error":"VARCHAR","elevation":"VARCHAR","depth":"VARCHAR","georeference_protocol":"VARCHAR","source_authority":"VARCHAR","primary_spatial_data":"VARCHAR","locality_attributes":"JSON"}]')) AS e
@@ -225,7 +228,6 @@ TABLES = {
         LEFT JOIN flat USING (locality_id)
         ORDER BY loc.locality_id
     """,
-
     "specimen_events": r"""
         SELECT
             id,
@@ -259,7 +261,6 @@ TABLES = {
         )
         ORDER BY id
     """,
-
     "identifications": r"""
         SELECT
             id,
@@ -286,7 +287,6 @@ TABLES = {
         )
         ORDER BY i.scientific_name
     """,
-
     "identification_taxa": r"""
         SELECT
             url_id(i.identificationID) AS identification_id,
@@ -302,7 +302,6 @@ TABLES = {
         )
         ORDER BY taxon_key
     """,
-
     # epithet (binomials only) and family are precomputed for the synonym heuristic
     "taxa": r"""
         SELECT *,
@@ -329,14 +328,12 @@ TABLES = {
         )
         ORDER BY name
     """,
-
     # Staging table so partdetail is parsed once for both parts and part_attributes.
     "_parts_raw": r"""
         SELECT collection_object_id AS id, unnest(from_json(partdetail, '[{"partID":"VARCHAR","parentPartID":"VARCHAR","part_name":"VARCHAR","condition":"VARCHAR","part_count":"BIGINT","disposition":"VARCHAR","part_remark":"VARCHAR","part_barcode":"VARCHAR","container_path":"VARCHAR","part_attributes":[{"attribute_type":"VARCHAR","attribute_value":"VARCHAR","attribute_units":"VARCHAR","attribute_date":"VARCHAR","attribute_method":"VARCHAR","attribute_remark":"VARCHAR","attribute_determiner":"JSON","attribute_determiner_id":"VARCHAR"}]}]')) AS p
         FROM src
         WHERE partdetail IS NOT NULL
     """,
-
     "parts": r"""
         SELECT
             id,
@@ -352,7 +349,6 @@ TABLES = {
         FROM _parts_raw
         ORDER BY p.part_name
     """,
-
     # part_name is copied in so part searches never have to join the 8M-row parts table
     "part_attributes": r"""
         SELECT
@@ -377,7 +373,6 @@ TABLES = {
         )
         ORDER BY a.attribute_type, a.attribute_value
     """,
-
     "attributes": r"""
         SELECT
             id,
@@ -396,7 +391,6 @@ TABLES = {
         )
         ORDER BY a.attribute_type, a.attribute_value
     """,
-
     "identifiers": r"""
         SELECT
             id,
@@ -415,7 +409,6 @@ TABLES = {
         )
         ORDER BY x.identifier_type, x.identifier
     """,
-
     # media and media_tags share one table; tag rows have tag_id set
     "media": r"""
         SELECT * FROM (
@@ -454,7 +447,6 @@ TABLES = {
         )
         ORDER BY media_type, id
     """,
-
     "citations": r"""
         SELECT
             id,
@@ -474,7 +466,6 @@ TABLES = {
         )
         ORDER BY c.type_status, c.cited_name
     """,
-
     # dst_id is set when the target is a record in this database;
     # external identifiers keep only dst_value.
     "related_records": r"""
@@ -486,7 +477,12 @@ TABLES = {
                 r.relationship,
                 r.identifier_type,
                 r.record AS dst_value,
-                nullif(regexp_extract(r.record, '/guid/(.+)$', 1), '') AS dst_guid,
+                -- the target arrives as an Arctos URL or as a bare GUID; anything else
+                -- (a barcode, a GenBank URL) names no record
+                coalesce(
+                    nullif(regexp_extract(r.record, '/guid/(.+)$', 1), ''),
+                    CASE WHEN regexp_matches(trim(r.record), '^[A-Za-z]+:[A-Za-z]+:.+$') THEN trim(r.record) END
+                ) AS dst_guid,
                 r.remarks,
                 url_id(r.issued_by.agentID) AS issued_by_agent_id,
                 r.issued_by.agent_name AS issued_by_name,
@@ -509,7 +505,6 @@ TABLES = {
         LEFT JOIN records d ON d.guid = e.dst_guid
         ORDER BY relationship, src_prefix, src_id
     """,
-
     "record_agents": r"""
         SELECT
             id,
@@ -524,7 +519,6 @@ TABLES = {
         )
         ORDER BY agent_id
     """,
-
     # collectors/preparators plus identification determiners
     "agents": r"""
         SELECT agent_id, mode(agent_name) AS agent_name
@@ -543,7 +537,6 @@ TABLES = {
         GROUP BY agent_id
         ORDER BY agent_name
     """,
-
     "loans": r"""
         SELECT
             id,
@@ -567,12 +560,14 @@ TABLES = {
 
 
 def convert_csv(csv, parquet, temp_dir):
-    d = duckdb.connect(config={
-        "threads": 2,
-        "preserve_insertion_order": True,
-        "memory_limit": MEMORY_LIMIT,
-        "temp_directory": str(temp_dir),
-    })
+    d = duckdb.connect(
+        config={
+            "threads": 2,
+            "preserve_insertion_order": True,
+            "memory_limit": MEMORY_LIMIT,
+            "temp_directory": str(temp_dir),
+        }
+    )
 
     with d.cursor() as cursor:
         cursor.execute(f"""
@@ -594,7 +589,16 @@ def convert_csv(csv, parquet, temp_dir):
         print(f"rejected rows: {rejected}")
 
 
-def build_database(cursor, parquet):
+def snapshot_date(csv):
+    """The export day in the CSV's name: filtered_flat-2026_17_7.csv is 17 July 2026."""
+    match = re.search(r"(\d{4})_(\d{1,2})_(\d{1,2})", csv.name)
+    if not match:
+        raise SystemExit(f"no year_day_month date in the name of {csv.name}; pass --snapshot-date")
+    year, day, month = map(int, match.groups())
+    return date(year, month, day)
+
+
+def build_database(cursor, parquet, snapshot):
     cursor.execute(f"CREATE OR REPLACE TEMP VIEW src AS SELECT * FROM read_parquet('{parquet}')")
     # trailing number of an Arctos URL: .../agent/123, .../IID123, .../PID123, .../media/123
     cursor.execute(r"CREATE OR REPLACE TEMP MACRO url_id(u) AS TRY_CAST(regexp_extract(u, '(\d+)$', 1) AS BIGINT)")
@@ -605,6 +609,9 @@ def build_database(cursor, parquet):
         cursor.execute(f"CREATE OR REPLACE {temp}TABLE {name} AS {query}")
         rows = cursor.execute(f"SELECT count(*) FROM {name}").fetchone()[0]
         print(f"{name}: {rows} rows in {(datetime.now() - start).total_seconds():.0f} s", flush=True)
+
+    cursor.execute("CREATE OR REPLACE TABLE snapshot AS SELECT ?::DATE AS snapshot_date", [snapshot])
+    print(f"snapshot: {snapshot}", flush=True)
 
     cursor.execute("""
         CREATE OR REPLACE TABLE collections AS
@@ -621,9 +628,16 @@ def main():
     parser = argparse.ArgumentParser(description="Build arctos.duckdb from the flat Arctos CSV export.")
     parser.add_argument("csv", type=Path, help="filtered_flat-XXXX.csv")
     parser.add_argument(
-        "--out-dir", type=Path, default=DEFAULT_DATA,
-        help="where arctos.parquet and arctos.duckdb go (default: the repo's data/)")
+        "--out-dir",
+        type=Path,
+        default=DEFAULT_DATA,
+        help="where arctos.parquet and arctos.duckdb go (default: the repo's data/)",
+    )
+    parser.add_argument(
+        "--snapshot-date", type=date.fromisoformat, default=None,
+        help="the day of the flat export, YYYY-MM-DD (default: read from the CSV's name)")
     args = parser.parse_args()
+    snapshot = args.snapshot_date or snapshot_date(args.csv)
 
     out = args.out_dir.resolve()
     out.mkdir(parents=True, exist_ok=True)
@@ -641,12 +655,15 @@ def main():
     # reading it until it reopens the file, and nothing ever sees a half-built database.
     new.unlink(missing_ok=True)
     new.with_name(new.name + ".wal").unlink(missing_ok=True)
-    with duckdb.connect(str(new), config={
-        "memory_limit": MEMORY_LIMIT,
-        "preserve_insertion_order": False,
-        "temp_directory": str(tmp),
-    }) as d:
-        build_database(d, parquet)
+    with duckdb.connect(
+        str(new),
+        config={
+            "memory_limit": MEMORY_LIMIT,
+            "preserve_insertion_order": False,
+            "temp_directory": str(tmp),
+        },
+    ) as d:
+        build_database(d, parquet, snapshot)
         d.execute("CHECKPOINT")
     os.replace(new, db)
     print(f"wrote {db}")
