@@ -38,6 +38,7 @@ start() {
         --host {{ uvicorn_host }} \
         --port {{ uvicorn_port }} \
         --workers {{ uvicorn_workers }} \
+        --root-path {{ root_path }} \
         --proxy-headers \
         --forwarded-allow-ips '*' \
         --timeout-graceful-shutdown 30 \
