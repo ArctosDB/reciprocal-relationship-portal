@@ -149,9 +149,15 @@ NESTED = {
 }
 
 RELATED_GUID = "related_guid"
-"""On a matched record: the guids of the records it reaches by the relations
-the search asked for. Not the record's whole `relations` list, which holds
-every link it has in Arctos."""
+RELATED_NAME = "related_scientific_name"
+RELATED_COLUMNS = (RELATED_GUID, RELATED_NAME)
+"""The other end of a row's links, by the relations the search asked for: the
+guids, and the distinct scientific names, so the related taxa read at a glance.
+
+On a matched record they are the records it reaches. That is not the record's
+whole `relations` list, which holds every link it has in Arctos. A link leaving
+the database has no guid, and its name is the identification Arctos cached. On
+a related record they point back at the matched records it was reached from."""
 
 LOCALITY_COLUMNS = (
     "spec_locality",
@@ -298,7 +304,7 @@ class Translator:
 
     def _edges_cte(self, rows: Sequence[TaxonRow]) -> str:
         return f"""edges AS (
-            SELECT e.src_id, e.dst_id, e.dst_guid, e.relationship
+            SELECT e.src_id, e.dst_id, e.dst_guid, e.dst_identification, e.relationship
             FROM related_records e
             WHERE {_any([self._edge(row) for row in rows])}
         )"""
@@ -441,51 +447,60 @@ class Translator:
             ORDER BY page.guid
         """)
 
-    def related_guids(self, ids: Sequence[int]) -> tuple[str, dict[str, Any]]:
-        """For the records `ids`, the guids each reaches by the edges asked for."""
-        return self.statement(
-            f"""
-            {self._with()}
-            SELECT src_id, list(DISTINCT dst_guid ORDER BY dst_guid)
-            FROM edges
-            WHERE src_id IN ({_PAGE_IDS}) AND dst_guid IS NOT NULL
-            GROUP BY src_id
-            """,
-            ids=list(ids),
-        )
+    def _reached(self, where: str = "") -> str:
+        """`(src_id, related_guid, related_scientific_name)`: what each record
+        reaches by the edges asked for. `where` narrows the edges read."""
+        return f"""
+            SELECT e.src_id,
+                list(DISTINCT e.dst_guid ORDER BY e.dst_guid) FILTER (e.dst_guid IS NOT NULL) AS related_guid,
+                list(DISTINCT e.name ORDER BY e.name) FILTER (e.name IS NOT NULL) AS related_scientific_name
+            FROM (
+                SELECT e.src_id, e.dst_guid, nullif(coalesce(d.scientific_name, e.dst_identification), '') AS name
+                FROM edges e LEFT JOIN records d ON d.collection_object_id = e.dst_id
+                {where}
+            ) e
+            GROUP BY e.src_id
+        """
+
+    def reached(self, ids: Sequence[int]) -> tuple[str, dict[str, Any]]:
+        """For the records `ids`, their `RELATED_COLUMNS`, id first."""
+        return self.statement(f"{self._with()} {self._reached(f'WHERE e.src_id IN ({_PAGE_IDS})')}", ids=list(ids))
 
     def _picked(self, *, related: bool) -> list[str]:
-        """The CTEs ending in `picked(id, related_guid)`: the rows of the table
-        being viewed, each with the guids on the other end of its links.
+        """The CTEs ending in `picked(id, related_guid, related_scientific_name)`:
+        the rows of the table being viewed, each with the other end of its links.
 
-        Viewing the specimens, a row is a matched record and `related_guid` the
-        records it reaches. Viewing a relationship's tab, a row is a record the
-        matched ones reach by that relationship, and `related_guid` points back
-        at them. The predicate stays on the specimen's side of the link either
+        Viewing the specimens, a row is a matched record and the related columns
+        the records it reaches. Viewing a relationship's tab, a row is a record
+        the matched ones reach by that relationship, and the related columns
+        point back at them. The predicate stays on the specimen's side of the link either
         way, so the related table never reasons about inverses, and no other
         filter of the form reaches the related records.
         """
-        hits = f"hits AS MATERIALIZED (SELECT r.collection_object_id AS id, r.guid FROM records r WHERE {self._where()})"
+        hits = f"""hits AS MATERIALIZED (
+                SELECT r.collection_object_id AS id, r.guid, nullif(r.scientific_name, '') AS name
+                FROM records r WHERE {self._where()}
+            )"""
+        none = "NULL::VARCHAR[] AS related_guid, NULL::VARCHAR[] AS related_scientific_name"
         if not self._edges:
             # No row asked for a relation: nothing is reached, and nothing reaches.
             only = "FROM hits WHERE FALSE" if related else "FROM hits"
-            return [hits, f"picked AS (SELECT id, NULL::VARCHAR[] AS related_guid {only})"]
+            return [hits, f"picked AS (SELECT id, {none} {only})"]
         if related:
             # A tab shows one relationship of those the rows asked for.
             tab = f"AND lower(e.relationship) = lower({self._bind(self.search.tab)})" if self.search.tab else ""
             picked = f"""picked AS (
-                SELECT e.dst_id AS id, list(DISTINCT h.guid ORDER BY h.guid) AS related_guid
+                SELECT e.dst_id AS id,
+                    list(DISTINCT h.guid ORDER BY h.guid) AS related_guid,
+                    list(DISTINCT h.name ORDER BY h.name) FILTER (h.name IS NOT NULL) AS related_scientific_name
                 FROM edges e JOIN hits h ON h.id = e.src_id
                 WHERE e.dst_id IS NOT NULL {tab}
                 GROUP BY e.dst_id
             )"""
         else:
-            picked = """picked AS (
-                SELECT h.id, x.guids AS related_guid
-                FROM hits h LEFT JOIN (
-                    SELECT src_id, list(DISTINCT dst_guid ORDER BY dst_guid) AS guids
-                    FROM edges WHERE dst_guid IS NOT NULL GROUP BY src_id
-                ) x ON x.src_id = h.id
+            picked = f"""picked AS (
+                SELECT h.id, x.related_guid, x.related_scientific_name
+                FROM hits h LEFT JOIN ({self._reached()}) x ON x.src_id = h.id
             )"""
         return [hits, picked]
 
@@ -503,7 +518,7 @@ class Translator:
         locality = "".join(f", l.{c}" for c in locality_columns)
         offset = (self.search.page - 1) * PER_PAGE
         page = f"""page AS (
-                SELECT {select}, p.related_guid
+                SELECT {select}, p.related_guid, p.related_scientific_name
                 FROM picked p JOIN records r ON r.collection_object_id = p.id
                 ORDER BY r.guid LIMIT {PER_PAGE} OFFSET {offset}
             )"""
@@ -521,12 +536,12 @@ class Translator:
         `columns` as the header. DuckDB writes the file itself, which is several
         times quicker than moving the rows through Python.
 
-        A nested column holds its JSON text and `related_guid` its guids joined
-        with `"; "`, because a CSV cell holds one value.
+        A nested column holds its JSON text and a related column its values
+        joined with `"; "`, because a CSV cell holds one value.
         """
         flat = [c for c in columns if c in record_columns and c != "guid"]
         out = f"""out AS MATERIALIZED (
-                SELECT p.id, p.related_guid, r.guid, r.locality_id{"".join(f", r.{c}" for c in flat)}
+                SELECT p.*, r.guid, r.locality_id{"".join(f", r.{c}" for c in flat)}
                 FROM picked p JOIN records r ON r.collection_object_id = p.id
             )"""
         ctes, joins, select = [out], [], []
@@ -537,8 +552,8 @@ class Translator:
                 select.append(f"to_json(n_{column}.v) AS {column}")
             elif column in LOCALITY_COLUMNS:
                 select.append(f"l.{column}")
-            elif column == RELATED_GUID:
-                select.append(f"array_to_string(out.related_guid, '; ') AS {column}")
+            elif column in RELATED_COLUMNS:
+                select.append(f"array_to_string(out.{column}, '; ') AS {column}")
             else:
                 select.append(f"out.{column}")
         if any(c in LOCALITY_COLUMNS for c in columns):

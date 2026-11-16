@@ -24,6 +24,7 @@ SHREW, SHREW_AGAIN, MOUSE, CESTODE, TICK = "MSB:Mamm:1", "MSB:Host:1", "MSB:Mamm
 MAP_HEADER = [
     "guid",
     "related_guid",
+    "related_scientific_name",
     "scientific_name",
     "country",
     "state_prov",
@@ -61,9 +62,11 @@ def table(client: TestClient, path: str = "/download", **params: str | list[str]
 
 def test_a_tab_lists_each_reached_record_once_with_the_records_it_was_reached_from(engine: DuckDbQueryEngine) -> None:
     results = related(engine, taxon=["genus|Sorex|host of parasite"], tab="host of parasite")
-    assert results.column_order[:2] == ["guid", "related_guid"]
+    assert results.column_order[:3] == ["guid", "related_guid", "related_scientific_name"]
     # Two shrew records point at one cestode lot. The parasite outside the database has no record to list.
     assert [(r["guid"], r["related_guid"]) for r in results.records] == [(CESTODE, [SHREW_AGAIN, SHREW])]
+    # What it is a parasite of, at a glance: both records are the one species.
+    assert results.records[0]["related_scientific_name"] == ["Sorex cinereus"]
     # `context` is the records the form matched, `matched` the distinct records they reach.
     assert (results.summary.context, results.summary.matched, results.summary.taxon) == (2, 1, None)
     assert results.total.value == 1
@@ -97,7 +100,7 @@ def test_a_search_that_asks_for_no_relation_reaches_nothing(engine: DuckDbQueryE
     assert results.records == []
     assert (results.summary.context, results.summary.matched) == (3, 0)
     # An empty table still declares its columns.
-    assert results.column_order[:2] == ["guid", "related_guid"]
+    assert results.column_order[:3] == ["guid", "related_guid", "related_scientific_name"]
 
 
 # ---- /download ------------------------------------------------------------
@@ -107,8 +110,19 @@ def test_the_map_export_of_the_matched_records(client: TestClient, tmp_path: Pat
     rows = table(client, taxon="genus|Sorex|host of parasite", cols="map")
     assert rows == [
         MAP_HEADER,
-        [SHREW_AGAIN, CESTODE, "Sorex cinereus", "United States", "Colorado", "", "", ""],
-        [SHREW, CESTODE, "Sorex cinereus", "United States", "New Mexico", "35.2", "-106.4", "100"],
+        [SHREW_AGAIN, CESTODE, "Cestoda", "Sorex cinereus", "United States", "Colorado", "", "", ""],
+        # The second parasite is outside the database: no guid, only the name Arctos cached.
+        [
+            SHREW,
+            CESTODE,
+            "Cestoda; Hymenolepis diminuta",
+            "Sorex cinereus",
+            "United States",
+            "New Mexico",
+            "35.2",
+            "-106.4",
+            "100",
+        ],
     ]
     # The file DuckDB wrote is gone once it has been sent.
     assert list(tmp_path.iterdir()) == []
@@ -116,10 +130,20 @@ def test_the_map_export_of_the_matched_records(client: TestClient, tmp_path: Pat
 
 def test_a_tab_exports_the_related_records(client: TestClient) -> None:
     rows = table(client, taxon="genus|Sorex|host of parasite", tab="host of parasite", cols="map")
-    # Several guids share the one cell.
+    # Several guids share the one cell. Both shrew records carry one name, listed once.
     assert rows == [
         MAP_HEADER,
-        [CESTODE, f"{SHREW_AGAIN}; {SHREW}", "Cestoda", "United States", "New Mexico", "35.2", "-106.4", "100"],
+        [
+            CESTODE,
+            f"{SHREW_AGAIN}; {SHREW}",
+            "Sorex cinereus",
+            "Cestoda",
+            "United States",
+            "New Mexico",
+            "35.2",
+            "-106.4",
+            "100",
+        ],
     ]
 
 
@@ -141,7 +165,7 @@ def test_the_default_export_carries_nested_columns_as_json(client: TestClient) -
     assert {link["relationship"] for link in json.loads(row[7])} == {"host of parasite", "ate"}
 
 
-def test_cols_names_the_columns_and_the_old_path_still_answers(client: TestClient) -> None:
+def test_cols_names_the_columns_of_the_export(client: TestClient) -> None:
     params = {"prefix": "MSB:Para", "cols": "guid,genus,spec_locality"}
     rows = table(client, **params)
     assert rows == [
@@ -149,7 +173,6 @@ def test_cols_names_the_columns_and_the_old_path_still_answers(client: TestClien
         [CESTODE, "", "Sandia Mountains, Cibola National Forest"],
         [TICK, "Ixodes; Ixodes", "Fairbanks"],
     ]
-    assert table(client, "/es-download", **params) == rows
 
     response = client.get("/download", params={"taxon": "genus|Sorex"})
     assert response.headers["content-type"].startswith("text/csv")

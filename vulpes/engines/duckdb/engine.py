@@ -1,6 +1,6 @@
 import tempfile
 from collections import defaultdict
-from collections.abc import Callable, Iterator, Mapping, Sequence
+from collections.abc import Callable, Iterator, Sequence
 from datetime import UTC, date, datetime
 from pathlib import Path
 from typing import Any, override
@@ -17,7 +17,7 @@ from vulpes.engines.duckdb.translate import (
     MAP_COLUMNS,
     MAP_PRESET,
     NESTED,
-    RELATED_GUID,
+    RELATED_COLUMNS,
     Translator,
     nested,
 )
@@ -67,7 +67,7 @@ class DuckDbQueryEngine(QueryEngine):
             self._schema = build_schema(
                 cursor,
                 code_tables or Path(path).parent / "code-tables",
-                columns=[*self.record_columns, *LOCALITY_COLUMNS, *NESTED, RELATED_GUID],
+                columns=[*self.record_columns, *LOCALITY_COLUMNS, *NESTED, *RELATED_COLUMNS],
                 snapshot=self._snapshot_date(cursor),
             )
 
@@ -93,15 +93,15 @@ class DuckDbQueryEngine(QueryEngine):
 
     def _columns(self, search: Search, default: Sequence[str], *, related: bool) -> list[str]:
         """The columns of a page or an export, in order. `related` says whether
-        its rows are linked to anything, which is when `related_guid` holds a
-        value: always on a related-records table, and on the matched records
+        its rows are linked to anything, which is when the related columns hold
+        a value: always on a related-records table, and on the matched records
         when the search asked for a relation."""
         preset = MAP_COLUMNS if search.cols == (MAP_PRESET,) else None
         if preset or not search.cols:
             columns = list(preset or default)
             if related:
-                # Beside the `guid` it pairs with.
-                columns.insert(1, RELATED_GUID)
+                # Beside the `guid` they pair with.
+                columns[1:1] = RELATED_COLUMNS
             return columns
         for column in search.cols:
             if column not in self._schema.columns:
@@ -158,7 +158,7 @@ class DuckDbQueryEngine(QueryEngine):
             specimens, reached = cursor.execute(*sql.picked_counts(related=True)).fetchall()[0]
             flat = [c for c in columns if c in self.record_columns and c != "guid"]
             locality = [c for c in columns if c in LOCALITY_COLUMNS]
-            records = self._records(cursor, columns, sql.related_page(flat, locality), {})
+            records = self._records(cursor, columns, sql.related_page(flat, locality), None)
 
         return SearchResults(
             total=Total(value=reached, relation="eq"),
@@ -172,10 +172,11 @@ class DuckDbQueryEngine(QueryEngine):
         cursor: duckdb.DuckDBPyConnection,
         columns: Sequence[str],
         page: tuple[str, dict[str, Any]],
-        by_ids: Mapping[str, Callable[[list[int]], tuple[str, dict[str, Any]]]],
+        reached: Callable[[list[int]], tuple[str, dict[str, Any]]] | None,
     ) -> list[dict[str, Any]]:
         """The records of one page statement, each with its nested columns.
-        `by_ids` holds further statements keyed by the page's ids, by column."""
+        `reached` is the statement giving the related columns for the page's
+        ids, when the page statement does not carry them itself."""
         result = cursor.execute(*page)
         names = [d[0] for d in result.description]
         rows = [dict(zip(names, row, strict=True)) for row in result.fetchall()]
@@ -187,8 +188,11 @@ class DuckDbQueryEngine(QueryEngine):
             for column in columns:
                 if column in NESTED:
                     lookups[column] = dict(cursor.execute(nested(column), {"ids": ids}).fetchall())
-                elif column in by_ids:
-                    lookups[column] = dict(cursor.execute(*by_ids[column](ids)).fetchall())
+
+            if reached and any(c in RELATED_COLUMNS for c in columns):
+                found = cursor.execute(*reached(ids)).fetchall()
+                for i, column in enumerate(RELATED_COLUMNS, start=1):
+                    lookups[column] = {row[0]: row[i] for row in found}
 
         records = []
         for record_id, row in zip(ids, rows, strict=True):
@@ -209,7 +213,7 @@ class DuckDbQueryEngine(QueryEngine):
 
             flat = [c for c in columns if c in self.record_columns and c != "guid"]
             locality = [c for c in columns if c in LOCALITY_COLUMNS]
-            reached = {RELATED_GUID: sql.related_guids} if search.constrains_relations else {}
+            reached = sql.reached if search.constrains_relations else None
             records = self._records(cursor, columns, sql.page(flat, locality), reached)
 
         return SearchResults(

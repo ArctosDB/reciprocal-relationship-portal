@@ -60,7 +60,8 @@ def test_taxon_rows_or_together(engine: DuckDbQueryEngine) -> None:
 
 def test_a_pairwise_search_selects_the_searched_side_and_names_what_it_reaches(engine: DuckDbQueryEngine) -> None:
     results = run(engine, taxon=["genus|Sorex|host of parasite|class|Cestoda"])
-    assert results.column_order[:2] == ["guid", "related_guid"]
+    assert results.column_order[:3] == ["guid", "related_guid", "related_scientific_name"]
+    assert [r["related_scientific_name"] for r in results.records] == [["Cestoda"], ["Cestoda"]]
     assert [(r["guid"], r["related_guid"]) for r in results.records] == [
         (SHREW_AGAIN, [CESTODE]),
         (SHREW, [CESTODE]),
@@ -88,8 +89,9 @@ def test_the_relationship_and_the_related_taxon_must_be_the_same_link(engine: Du
 def test_a_link_leaving_the_database_matches_on_what_arctos_cached(engine: DuckDbQueryEngine) -> None:
     assert guids(engine, taxon=["||host of parasite|family|Hymenolepididae"]) == [SHREW]
     results = run(engine, taxon=["||host of parasite|scientific_name|Hymenolepis"])
-    # It names no record, so there is no guid to list.
+    # It names no record, so there is no guid to list, but Arctos cached what it is.
     assert [(r["guid"], r.get("related_guid")) for r in results.records] == [(SHREW, None)]
+    assert results.records[0]["related_scientific_name"] == ["Hymenolepis diminuta"]
     # Only the family and the identification are cached, never the other ranks.
     assert guids(engine, taxon=["||host of parasite|genus|Hymenolepis"]) == []
 
