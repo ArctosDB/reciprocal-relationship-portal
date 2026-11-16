@@ -206,19 +206,6 @@ def test_answers_are_cacheable_until_the_next_snapshot(client: TestClient) -> No
     assert "cache-control" not in client.get("/search", params={"page": "0"}).headers
 
 
-def test_the_schema_is_the_same_document_compressed_or_not(client: TestClient, engine: DuckDbQueryEngine) -> None:
-    expected = json.loads(engine.schema().model_dump_json())
-    packed = client.get("/schema", headers={"Accept-Encoding": "gzip"})
-    assert packed.headers["content-encoding"] == "gzip"
-    assert packed.json() == expected
-    plain = client.get("/schema", headers={"Accept-Encoding": "identity"})
-    assert "content-encoding" not in plain.headers
-    assert plain.json() == expected
-    assert packed.headers["vary"] == plain.headers["vary"] == "Accept-Encoding"
-    # The route still documents the shape it returns.
-    assert "Schema" in client.get("/openapi.json").text
-
-
 # ---- /berkeleymapper.xml --------------------------------------------------
 
 

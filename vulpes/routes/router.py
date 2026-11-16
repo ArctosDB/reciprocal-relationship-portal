@@ -1,8 +1,7 @@
-import gzip
 from pathlib import Path
 from typing import Annotated
 
-from fastapi import APIRouter, Query, Request, Response
+from fastapi import APIRouter, Query, Response
 from opentelemetry import trace
 
 from vulpes.engines.abc import CSVStreamingResponse, QueryEngine
@@ -26,11 +25,6 @@ def make_router(engine: QueryEngine) -> APIRouter:
     """
     router = APIRouter()
 
-    # The schema is fixed for the life of the process and large, so it is
-    # written and compressed once here, not on every request (60 ms each).
-    schema_json = engine.schema().model_dump_json().encode()
-    schema_gzip = gzip.compress(schema_json)
-
     @router.get("/download", response_class=CSVStreamingResponse)
     def download(query: Annotated[ArctosQuery, Query()]) -> CSVStreamingResponse:
         with tracer.start_as_current_span(f"{engine.name}.download"):
@@ -47,16 +41,11 @@ def make_router(engine: QueryEngine) -> APIRouter:
         with tracer.start_as_current_span(f"{engine.name}.relations"):
             return engine.relations(query)
 
-    @router.get("/schema", response_model=Schema)
-    def schema(request: Request) -> Response:
-        # `Vary` keeps a shared cache from handing the compressed bytes to a
-        # client that did not ask for them.
-        headers = {"Cache-Control": SCHEMA_CACHE, "Vary": "Accept-Encoding"}
-        body = schema_json
-        if "gzip" in request.headers.get("Accept-Encoding", ""):
-            headers["Content-Encoding"] = "gzip"
-            body = schema_gzip
-        return Response(body, media_type="application/json", headers=headers)
+    @router.get("/schema")
+    def schema(response: Response) -> Schema:
+        response.headers["Cache-Control"] = SCHEMA_CACHE
+        with tracer.start_as_current_span(f"{engine.name}.schema"):
+            return engine.schema()
 
     @router.get("/search")
     def search(response: Response, query: Annotated[ArctosQuery, Query()]) -> SearchResults:
