@@ -1,3 +1,4 @@
+from pathlib import Path
 from typing import Annotated
 
 from fastapi import APIRouter, Query, Response
@@ -9,6 +10,8 @@ from vulpes.models.responses import Schema, SearchResults, SearchSummary, TaxaRe
 
 tracer = trace.get_tracer(__name__)
 
+MAPPER_CONFIG = (Path(__file__).parent.parent / "config" / "berkeleymapper.xml").read_bytes()
+
 
 def make_router(engine: QueryEngine) -> APIRouter:
     """
@@ -16,10 +19,16 @@ def make_router(engine: QueryEngine) -> APIRouter:
     """
     router = APIRouter()
 
+    # The portal still asks for the export under the name the old service gave it.
     @router.get("/download", response_class=CSVStreamingResponse)
     def download(query: Annotated[ArctosQuery, Query()]) -> CSVStreamingResponse:
         with tracer.start_as_current_span(f"{engine.name}.download"):
             return engine.download(query)
+
+    @router.get("/berkeleymapper.xml")
+    def berkeleymapper() -> Response:
+        """The BerkeleyMapper config for a `cols=map` download."""
+        return Response(MAPPER_CONFIG, media_type="application/xml", headers={"Cache-Control": "public, max-age=3600"})
 
     @router.get("/relations")
     def relations(query: Annotated[ArctosQuery, Query()]) -> SearchResults:

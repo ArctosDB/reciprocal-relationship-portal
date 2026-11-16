@@ -21,6 +21,8 @@ attr, part  A row is a semi join on `attributes` or `parts`; a negated row is
             the anti join.
 dates       Both ends must hold for one event. A record with no event falls back
             to the dates on the record itself.
+tab         Not a filter. It names the table being viewed: absent, the matched
+            records; a relationship, the records they reach by it.
 
 Values never reach the SQL text. They are bound as parameters; only column
 names from this module's own tables are formatted in.
@@ -50,8 +52,10 @@ _PARAM = re.compile(r"\$(\w+)")
 _PAD = "left({col}, 10) || substr('-01-01', length(left({col}, 10)) - 3)"
 _YEAR = "CASE WHEN regexp_matches({col}, '^\\d{{4}}') THEN CAST(left({col}, 4) AS INTEGER) END"
 
-# The nested columns of a page, one query each, keyed by the ids of that page.
+# The nested columns, one query each, as `(record id, list)`. `%IDS%` stands for
+# the query giving the record ids wanted: a page's ids, or an export's rows.
 # Scanning a narrow id column is cheap; no table here is laid out for id lookups.
+_PAGE_IDS = "SELECT unnest($ids::BIGINT[])"
 NESTED = {
     "relations": """
         SELECT src_id, list({
@@ -64,14 +68,14 @@ NESTED = {
             'related_geography': dst_geography
         } ORDER BY relationship, dst_value)
         FROM related_records
-        WHERE src_id IN (SELECT unnest($ids::BIGINT[]))
+        WHERE src_id IN (%IDS%)
         GROUP BY src_id
     """,
     # The localities are fetched by the ids the events name. Joined straight to
     # the table, the same lookup read all of it (72 ms against 9).
     "events": """
         WITH e AS MATERIALIZED (
-            SELECT * FROM specimen_events WHERE id IN (SELECT unnest($ids::BIGINT[]))
+            SELECT * FROM specimen_events WHERE id IN (%IDS%)
         ),
         l AS (
             SELECT locality_id, higher_geog, spec_locality, dec_lat, dec_long
@@ -109,7 +113,7 @@ NESTED = {
             'attribute_determiner': determiner_name
         } ORDER BY attribute_type, attribute_value)
         FROM attributes
-        WHERE id IN (SELECT unnest($ids::BIGINT[]))
+        WHERE id IN (%IDS%)
         GROUP BY id
     """,
     "partdetail": """
@@ -136,10 +140,10 @@ NESTED = {
                 'attribute_determiner': determiner_name
             } ORDER BY attribute_type, attribute_value) AS attributes
             FROM part_attributes
-            WHERE id IN (SELECT unnest($ids::BIGINT[]))
+            WHERE id IN (%IDS%)
             GROUP BY part_id
         ) pa ON pa.part_id = p.part_id
-        WHERE p.id IN (SELECT unnest($ids::BIGINT[]))
+        WHERE p.id IN (%IDS%)
         GROUP BY p.id
     """,
 }
@@ -158,6 +162,34 @@ LOCALITY_COLUMNS = (
 )
 """Columns of the record's primary locality, which live on `localities`."""
 
+EXPORT_COLUMNS = (
+    "guid",
+    "scientific_name",
+    "country",
+    "state_prov",
+    "dec_lat",
+    "dec_long",
+    "attributedetail",
+    "relations",
+)
+"""The columns of a download that names none. Not every column: the column
+count sets the cost of an export."""
+
+MAP_COLUMNS = (
+    "guid",
+    "scientific_name",
+    "country",
+    "state_prov",
+    "dec_lat",
+    "dec_long",
+    "coordinateuncertaintyinmeters",
+)
+"""`cols=map`: what a map needs and nothing else, the columns
+`vulpes/config/berkeleymapper.xml` describes. BerkeleyMapper builds a balloon
+for every marker up front, so a nested column would stop the map drawing."""
+
+MAP_PRESET = "map"
+
 DEFAULT_COLUMNS = (
     "guid",
     "scientific_name",
@@ -169,6 +201,12 @@ DEFAULT_COLUMNS = (
     "attributedetail",
     "partdetail",
 )
+
+
+def nested(column: str, ids: str = _PAGE_IDS) -> str:
+    """The statement for one nested column of the records `ids` selects, by
+    default the page ids bound as `$ids`."""
+    return NESTED[column].replace("%IDS%", ids)
 
 
 def _any(clauses: Sequence[str]) -> str:
@@ -410,11 +448,110 @@ class Translator:
             {self._with()}
             SELECT src_id, list(DISTINCT dst_guid ORDER BY dst_guid)
             FROM edges
-            WHERE src_id IN (SELECT unnest($ids::BIGINT[])) AND dst_guid IS NOT NULL
+            WHERE src_id IN ({_PAGE_IDS}) AND dst_guid IS NOT NULL
             GROUP BY src_id
             """,
             ids=list(ids),
         )
+
+    def _picked(self, *, related: bool) -> list[str]:
+        """The CTEs ending in `picked(id, related_guid)`: the rows of the table
+        being viewed, each with the guids on the other end of its links.
+
+        Viewing the specimens, a row is a matched record and `related_guid` the
+        records it reaches. Viewing a relationship's tab, a row is a record the
+        matched ones reach by that relationship, and `related_guid` points back
+        at them. The predicate stays on the specimen's side of the link either
+        way, so the related table never reasons about inverses, and no other
+        filter of the form reaches the related records.
+        """
+        hits = f"hits AS MATERIALIZED (SELECT r.collection_object_id AS id, r.guid FROM records r WHERE {self._where()})"
+        if not self._edges:
+            # No row asked for a relation: nothing is reached, and nothing reaches.
+            only = "FROM hits WHERE FALSE" if related else "FROM hits"
+            return [hits, f"picked AS (SELECT id, NULL::VARCHAR[] AS related_guid {only})"]
+        if related:
+            # A tab shows one relationship of those the rows asked for.
+            tab = f"AND lower(e.relationship) = lower({self._bind(self.search.tab)})" if self.search.tab else ""
+            picked = f"""picked AS (
+                SELECT e.dst_id AS id, list(DISTINCT h.guid ORDER BY h.guid) AS related_guid
+                FROM edges e JOIN hits h ON h.id = e.src_id
+                WHERE e.dst_id IS NOT NULL {tab}
+                GROUP BY e.dst_id
+            )"""
+        else:
+            picked = """picked AS (
+                SELECT h.id, x.guids AS related_guid
+                FROM hits h LEFT JOIN (
+                    SELECT src_id, list(DISTINCT dst_guid ORDER BY dst_guid) AS guids
+                    FROM edges WHERE dst_guid IS NOT NULL GROUP BY src_id
+                ) x ON x.src_id = h.id
+            )"""
+        return [hits, picked]
+
+    def picked_counts(self, *, related: bool) -> tuple[str, dict[str, Any]]:
+        """How many records the form matched, and how many rows the table holds."""
+        return self.statement(f"""
+            {self._with(*self._picked(related=related))}
+            SELECT (SELECT count(*) FROM hits), (SELECT count(*) FROM picked)
+        """)
+
+    def related_page(self, record_columns: Collection[str], locality_columns: Collection[str]) -> tuple[str, dict[str, Any]]:
+        """One page of the related records in guid order, id first, each with
+        the matched records it was reached from."""
+        select = ", ".join(f"r.{c}" for c in ("collection_object_id", "guid", "locality_id", *record_columns))
+        locality = "".join(f", l.{c}" for c in locality_columns)
+        offset = (self.search.page - 1) * PER_PAGE
+        page = f"""page AS (
+                SELECT {select}, p.related_guid
+                FROM picked p JOIN records r ON r.collection_object_id = p.id
+                ORDER BY r.guid LIMIT {PER_PAGE} OFFSET {offset}
+            )"""
+        return self.statement(f"""
+            {self._with(*self._picked(related=True), page)}
+            SELECT page.* EXCLUDE (locality_id){locality}
+            FROM page LEFT JOIN localities l ON l.locality_id = page.locality_id
+            ORDER BY page.guid
+        """)
+
+    def export(
+        self, columns: Sequence[str], record_columns: Collection[str], path: str, *, related: bool
+    ) -> tuple[str, dict[str, Any]]:
+        """Write every row of the table as CSV to `path`, in guid order, with
+        `columns` as the header. DuckDB writes the file itself, which is several
+        times quicker than moving the rows through Python.
+
+        A nested column holds its JSON text and `related_guid` its guids joined
+        with `"; "`, because a CSV cell holds one value.
+        """
+        flat = [c for c in columns if c in record_columns and c != "guid"]
+        out = f"""out AS MATERIALIZED (
+                SELECT p.id, p.related_guid, r.guid, r.locality_id{"".join(f", r.{c}" for c in flat)}
+                FROM picked p JOIN records r ON r.collection_object_id = p.id
+            )"""
+        ctes, joins, select = [out], [], []
+        for column in columns:
+            if column in NESTED:
+                ctes.append(f"n_{column}(id, v) AS ({nested(column, 'SELECT id FROM out')})")
+                joins.append(f"LEFT JOIN n_{column} ON n_{column}.id = out.id")
+                select.append(f"to_json(n_{column}.v) AS {column}")
+            elif column in LOCALITY_COLUMNS:
+                select.append(f"l.{column}")
+            elif column == RELATED_GUID:
+                select.append(f"array_to_string(out.related_guid, '; ') AS {column}")
+            else:
+                select.append(f"out.{column}")
+        if any(c in LOCALITY_COLUMNS for c in columns):
+            joins.append("LEFT JOIN localities l ON l.locality_id = out.locality_id")
+        target = path.replace("'", "''")
+        return self.statement(f"""
+            COPY (
+                {self._with(*self._picked(related=related), *ctes)}
+                SELECT {", ".join(select)}
+                FROM out {" ".join(joins)}
+                ORDER BY out.guid
+            ) TO '{target}' (FORMAT csv, HEADER)
+        """)
 
     def summary(self, categorical: Collection[str]) -> tuple[str, dict[str, Any]]:
         """Every number of the summary as `(grp, stat, type, value, n)` rows.

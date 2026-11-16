@@ -104,8 +104,10 @@ class Summary(ResponseModel):
     """The search as a funnel. Each `attr` row is counted against `context`, not
     `matched`, so the row counts do not sum to `matched`."""
 
-    taxon: int
-    """The taxon rows alone, before any other filter narrows them."""
+    taxon: int | None = Field(None, exclude_if=lambda taxon: taxon is None)
+    """The taxon rows alone, before any other filter narrows them. Absent from
+    a related-records table, where `context` is the records the form matched
+    and `matched` the distinct records they reach."""
     context: int
     """The records the form selects without its `attr` rows."""
     matched: int

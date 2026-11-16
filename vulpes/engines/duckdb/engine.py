@@ -1,4 +1,6 @@
+import tempfile
 from collections import defaultdict
+from collections.abc import Callable, Iterator, Mapping, Sequence
 from datetime import UTC, date, datetime
 from pathlib import Path
 from typing import Any, override
@@ -10,10 +12,14 @@ from vulpes.engines.duckdb.schema import build as build_schema
 from vulpes.engines.duckdb.taxa import TaxonIndex
 from vulpes.engines.duckdb.translate import (
     DEFAULT_COLUMNS,
+    EXPORT_COLUMNS,
     LOCALITY_COLUMNS,
+    MAP_COLUMNS,
+    MAP_PRESET,
     NESTED,
     RELATED_GUID,
     Translator,
+    nested,
 )
 from vulpes.models.query import ArctosQuery
 from vulpes.models.responses import (
@@ -85,11 +91,15 @@ class DuckDbQueryEngine(QueryEngine):
     def _parse(self, query: ArctosQuery) -> Search:
         return Search.parse(query, self.relationships)
 
-    def _columns(self, search: Search) -> list[str]:
-        """The page's columns, in display order."""
-        if not search.cols:
-            columns = list(DEFAULT_COLUMNS)
-            if search.constrains_relations:
+    def _columns(self, search: Search, default: Sequence[str], *, related: bool) -> list[str]:
+        """The columns of a page or an export, in order. `related` says whether
+        its rows are linked to anything, which is when `related_guid` holds a
+        value: always on a related-records table, and on the matched records
+        when the search asked for a relation."""
+        preset = MAP_COLUMNS if search.cols == (MAP_PRESET,) else None
+        if preset or not search.cols:
+            columns = list(preset or default)
+            if related:
                 # Beside the `guid` it pairs with.
                 columns.insert(1, RELATED_GUID)
             return columns
@@ -101,16 +111,97 @@ class DuckDbQueryEngine(QueryEngine):
 
     @override
     def download(self, query: ArctosQuery) -> CSVStreamingResponse:
-        raise NotImplementedError
+        search = self._parse(query)
+        related = search.tab is not None
+        columns = self._columns(search, EXPORT_COLUMNS, related=related or search.constrains_relations)
+        sql = Translator(search)
+
+        with self.conn.cursor() as cursor:
+            # Refused before any row moves, rather than cut short: a truncated
+            # export is a plausible, wrong table.
+            _, rows = cursor.execute(*sql.picked_counts(related=related)).fetchall()[0]
+            limit = self._schema.limits.max_export_rows
+            if rows > limit:
+                msg = f"this export holds {rows:,} rows, more than the {limit:,} one download carries. Narrow the search"
+                raise BadQueryError(msg)
+
+            # DuckDB writes the CSV itself. The file is sent in pieces and then removed.
+            with tempfile.NamedTemporaryFile(prefix="arctos_", suffix=".csv", delete=False) as file:
+                path = Path(file.name)
+            try:
+                cursor.execute(*sql.export(columns, self.record_columns, str(path), related=related))
+            except BaseException:
+                path.unlink(missing_ok=True)
+                raise
+
+        def chunks() -> Iterator[bytes]:
+            try:
+                with path.open("rb") as csv:
+                    while chunk := csv.read(1 << 16):
+                        yield chunk
+            finally:
+                path.unlink(missing_ok=True)
+
+        stamp = datetime.now(tz=UTC).strftime("%Y%m%dT%H%M%SZ")
+        return CSVStreamingResponse(
+            chunks(),
+            headers={"Content-Disposition": f'attachment; filename="arctos_{stamp}.csv"'},
+        )
 
     @override
     def relations(self, query: ArctosQuery) -> SearchResults:
-        raise NotImplementedError
+        search = self._parse(query)
+        columns = self._columns(search, DEFAULT_COLUMNS, related=True)
+        sql = Translator(search)
+
+        with self.conn.cursor() as cursor:
+            specimens, reached = cursor.execute(*sql.picked_counts(related=True)).fetchall()[0]
+            flat = [c for c in columns if c in self.record_columns and c != "guid"]
+            locality = [c for c in columns if c in LOCALITY_COLUMNS]
+            records = self._records(cursor, columns, sql.related_page(flat, locality), {})
+
+        return SearchResults(
+            total=Total(value=reached, relation="eq"),
+            summary=Summary(context=specimens, matched=reached),
+            column_order=columns,
+            records=records,
+        )
+
+    def _records(
+        self,
+        cursor: duckdb.DuckDBPyConnection,
+        columns: Sequence[str],
+        page: tuple[str, dict[str, Any]],
+        by_ids: Mapping[str, Callable[[list[int]], tuple[str, dict[str, Any]]]],
+    ) -> list[dict[str, Any]]:
+        """The records of one page statement, each with its nested columns.
+        `by_ids` holds further statements keyed by the page's ids, by column."""
+        result = cursor.execute(*page)
+        names = [d[0] for d in result.description]
+        rows = [dict(zip(names, row, strict=True)) for row in result.fetchall()]
+        ids = [row.pop("collection_object_id") for row in rows]
+
+        # Each nested column is one more statement over the page's ids.
+        lookups: dict[str, dict[int, Any]] = {}
+        if ids:
+            for column in columns:
+                if column in NESTED:
+                    lookups[column] = dict(cursor.execute(nested(column), {"ids": ids}).fetchall())
+                elif column in by_ids:
+                    lookups[column] = dict(cursor.execute(*by_ids[column](ids)).fetchall())
+
+        records = []
+        for record_id, row in zip(ids, rows, strict=True):
+            for column, by_id in lookups.items():
+                row[column] = _compact(by_id.get(record_id))
+            # A record holds only the fields it has a value for, in display order.
+            records.append({c: row[c] for c in columns if row.get(c) is not None})
+        return records
 
     @override
     def search(self, query: ArctosQuery) -> SearchResults:
         search = self._parse(query)
-        columns = self._columns(search)
+        columns = self._columns(search, DEFAULT_COLUMNS, related=search.constrains_relations)
         sql = Translator(search)
 
         with self.conn.cursor() as cursor:
@@ -118,26 +209,8 @@ class DuckDbQueryEngine(QueryEngine):
 
             flat = [c for c in columns if c in self.record_columns and c != "guid"]
             locality = [c for c in columns if c in LOCALITY_COLUMNS]
-            page = cursor.execute(*sql.page(flat, locality))
-            names = [d[0] for d in page.description]
-            rows = [dict(zip(names, row, strict=True)) for row in page.fetchall()]
-            ids = [row.pop("collection_object_id") for row in rows]
-
-            # Each nested column is one more statement over the page's ids.
-            nested: dict[str, dict[int, Any]] = {}
-            if ids:
-                for column in columns:
-                    if column in NESTED:
-                        nested[column] = dict(cursor.execute(NESTED[column], {"ids": ids}).fetchall())
-                    elif column == RELATED_GUID and search.constrains_relations:
-                        nested[column] = dict(cursor.execute(*sql.related_guids(ids)).fetchall())
-
-        records = []
-        for record_id, row in zip(ids, rows, strict=True):
-            for column, by_id in nested.items():
-                row[column] = _compact(by_id.get(record_id))
-            # A record holds only the fields it has a value for, in display order.
-            records.append({c: row[c] for c in columns if row.get(c) is not None})
+            reached = {RELATED_GUID: sql.related_guids} if search.constrains_relations else {}
+            records = self._records(cursor, columns, sql.page(flat, locality), reached)
 
         return SearchResults(
             # DuckDB counts exactly, so there is never a `gte`.
