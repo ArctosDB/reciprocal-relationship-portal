@@ -6,7 +6,7 @@ Build data/arctos.duckdb from the filtered flat Arctos export, laid out for the
 search portal: filter by collection / attribute / part / relationship, return
 summary stats and a ~250-row sample fast, then download the full result.
 
-    python importer/build_duckdb.py data/filtered_flat-YYYY_D_M.csv [--out-dir DIR] [--snapshot-date YYYY-MM-DD]
+    python importer/build_duckdb.py data/filtered_flat-YYYY_D_M.csv [--out-dir DIR] [--snapshot-date YYYY-MM-DD] [--memory-limit 6GB]
 
 The day of the flat export is stored in the `snapshot` table, which the service
 reports as the date its data is current as of. It is read from the CSV's name
@@ -16,7 +16,7 @@ Outputs go to --out-dir (default: the repo's data/ directory, whatever the
 working directory). Converts the CSV to arctos.parquet once (skipped when the
 parquet is newer), then builds every table in TABLES into arctos.duckdb.new
 and renames it over arctos.duckdb, so a running app never sees a partial
-build (~4 min at 12 GB; the 6 GB MEMORY_LIMIT makes it slower). Every
+build (~4 min at 12 GB; a 6 GB --memory-limit makes it slower). Every
 layout decision below was measured on representative portal queries (median
 of 5, DuckDB 2.0.0, i7-11700K, warm cache). Times are DuckDB's own query time
 unless marked "wall", which adds converting the rows to Python tuples.
@@ -88,8 +88,6 @@ from pathlib import Path
 
 
 DEFAULT_DATA = Path(__file__).resolve().parent.parent / "data"
-# DuckDB buffer pool only; leaves headroom for Python and the CSV reader in the server's 10 GiB
-MEMORY_LIMIT = "6GB"
 
 JSON_COLS = [
     "partdetail",
@@ -559,14 +557,16 @@ TABLES = {
 }
 
 
-def convert_csv(csv, parquet, temp_dir):
+def duckdb_config(memory_limit, **config):
+    """Every core, and DuckDB's own default of 80% of RAM unless `memory_limit` says otherwise."""
+    return {**config, "memory_limit": memory_limit} if memory_limit else config
+
+
+def convert_csv(csv, parquet, temp_dir, memory_limit):
+    # Unsorted: every table in TABLES sorts itself, and sorting the whole wide export here
+    # ran out of memory. preserve_insertion_order=False lets threads write in parallel.
     d = duckdb.connect(
-        config={
-            "threads": 2,
-            "preserve_insertion_order": True,
-            "memory_limit": MEMORY_LIMIT,
-            "temp_directory": str(temp_dir),
-        }
+        config=duckdb_config(memory_limit, preserve_insertion_order=False, temp_directory=str(temp_dir))
     )
 
     with d.cursor() as cursor:
@@ -577,10 +577,13 @@ def convert_csv(csv, parquet, temp_dir):
                     types={{'af': 'VARCHAR'}},
                     ignore_errors=true,
                     store_rejects=true)
-                ORDER BY guid_prefix, guid
             )
             TO '{parquet}' (
-                FORMAT parquet, COMPRESSION snappy
+                FORMAT parquet, COMPRESSION snappy,
+                -- Each thread buffers a whole row group before writing it. At ~9 KB a row,
+                -- the default 122,880 rows is ~1 GB per thread, past RAM on 16 threads;
+                -- 16,384 rows is ~150 MB.
+                ROW_GROUP_SIZE 16384
             )
         """)
 
@@ -636,6 +639,9 @@ def main():
     parser.add_argument(
         "--snapshot-date", type=date.fromisoformat, default=None,
         help="the day of the flat export, YYYY-MM-DD (default: read from the CSV's name)")
+    parser.add_argument(
+        "--memory-limit", default=None,
+        help="DuckDB's buffer pool, e.g. 6GB (default: 80%% of RAM). Python and the CSV reader use more on top.")
     args = parser.parse_args()
     snapshot = args.snapshot_date or snapshot_date(args.csv)
 
@@ -649,7 +655,7 @@ def main():
 
     if not parquet.exists() or parquet.stat().st_mtime < args.csv.stat().st_mtime:
         print(f"converting {args.csv} to {parquet}", flush=True)
-        convert_csv(args.csv, parquet, tmp)
+        convert_csv(args.csv, parquet, tmp, args.memory_limit)
 
     # Build into a fresh file and swap it in at the end. An app with the old database open keeps
     # reading it until it reopens the file, and nothing ever sees a half-built database.
@@ -657,11 +663,7 @@ def main():
     new.with_name(new.name + ".wal").unlink(missing_ok=True)
     with duckdb.connect(
         str(new),
-        config={
-            "memory_limit": MEMORY_LIMIT,
-            "preserve_insertion_order": False,
-            "temp_directory": str(tmp),
-        },
+        config=duckdb_config(args.memory_limit, preserve_insertion_order=False, temp_directory=str(tmp)),
     ) as d:
         build_database(d, parquet, snapshot)
         d.execute("CHECKPOINT")

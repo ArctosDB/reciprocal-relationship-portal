@@ -5,8 +5,8 @@ grammar can raise. Each engine translates the parsed `Search`, so no engine
 re-reads the raw rows.
 """
 
-from collections.abc import Collection, Iterable
-from dataclasses import dataclass
+from collections.abc import Collection, Iterable, Mapping
+from dataclasses import dataclass, field
 from datetime import date
 from typing import Literal, NamedTuple
 
@@ -72,6 +72,9 @@ def split_pipes(raw: str) -> list[str]:
 
 
 _BARE = 2
+
+NULL_RELATIONSHIP = "null"
+"""The relationship a taxon row names for records related to nothing."""
 """The fields of a taxon row that names only `rank|name`. A longer row holds
 the relationships, then two fields per Related taxon."""
 
@@ -82,8 +85,19 @@ def _check_rank(rank: str) -> None:
         raise BadQueryError(msg)
 
 
-def _describe_taxon(rank: str, name: str) -> str:
-    return name if rank == "scientific_name" else f"{rank} {name}"
+Synonyms = Mapping[tuple[str, str], tuple[str, ...] | None]
+"""The other names each `(rank, name)` of the taxon rows also matches. `None`
+says the lookup failed, and the name matches alone."""
+
+
+def _describe_taxon(rank: str, name: str, synonyms: Synonyms) -> str:
+    text = name if rank == "scientific_name" else f"{rank} {name}"
+    found = synonyms.get((rank, name), ())
+    if found is None:
+        return f"{text} (synonyms unavailable)"
+    if found:
+        return f"{text} (or its synonym{'s' if len(found) > 1 else ''} {', '.join(found)})"
+    return text
 
 
 @dataclass(frozen=True)
@@ -95,12 +109,17 @@ class TaxonRow:
     relationships: tuple[str, ...]
     related: tuple[tuple[str, str], ...]
     """`(rank id, name)` pairs, each rank already checked."""
+    unrelated: bool = False
+    """The relationships named `null`: the row also takes records with no
+    relationship at all. It ORs with the other relationships, like they do
+    with each other, and is not one of `relationships`."""
 
     @classmethod
     def parse(cls, raw: str, known: Collection[str]) -> "TaxonRow":
         """`rank|name`, `rank|name|relationships`, or that followed by a
         `rank|name` pair per Related taxon. The relationships stay `;`-joined in
         the third segment, because the segment count identifies the shape.
+        `null` among them asks for records related to nothing.
 
         The searched name may be empty when the row names a relationship or a
         Related taxon; segment 0 is then ignored rather than checked."""
@@ -117,31 +136,44 @@ class TaxonRow:
                 raise BadQueryError(msg)
             _check_rank(rank)
 
-        relationships = tuple(k for k in (k.strip() for k in segments[2].split(";")) if k) if n > _BARE else ()
+        kinds = tuple(k for k in (k.strip() for k in segments[2].split(";")) if k) if n > _BARE else ()
+        unrelated = any(k.lower() == NULL_RELATIONSHIP for k in kinds)
+        relationships = tuple(k for k in kinds if k.lower() != NULL_RELATIONSHIP)
+        if related and unrelated and not relationships:
+            msg = "`taxon` names a related taxon for `null`, which relates to nothing"
+            raise BadQueryError(msg)
         for kind in relationships:
             if kind not in known:
                 msg = f"no relationship named `{kind}`"
                 raise BadQueryError(msg)
 
         rank, name = segments[0], segments[1]
-        if name or not (relationships or related):
+        if name or not (relationships or related or unrelated):
             if not name:
                 msg = "`taxon` carries an empty name"
                 raise BadQueryError(msg)
             _check_rank(rank)
-        return cls(rank, name, relationships, related)
+        return cls(rank, name, relationships, related, unrelated)
 
     @property
     def constrains_relations(self) -> bool:
         return bool(self.relationships or self.related)
 
-    def describe(self) -> str:
+    def taxa(self) -> Iterable[tuple[str, str]]:
+        """Every `(rank, name)` the row searches for, its own and the Related ones."""
+        if self.name:
+            yield self.rank, self.name
+        yield from self.related
+
+    def describe(self, synonyms: Synonyms) -> str:
         """This row in plain English, for `Search.description`."""
-        text = _describe_taxon(self.rank, self.name) if self.name else "any record"
+        text = _describe_taxon(self.rank, self.name, synonyms) if self.name else "any record"
         if self.relationships:
             text = f"{text} with relationship {' or '.join(self.relationships)}"
         if self.related:
-            text = f"{text} to {' or '.join(_describe_taxon(rank, name) for rank, name in self.related)}"
+            text = f"{text} to {' or '.join(_describe_taxon(rank, name, synonyms) for rank, name in self.related)}"
+        if self.unrelated:
+            text = f"{text}{', or' if self.constrains_relations else ''} with no relationships"
         return text
 
 
@@ -225,6 +257,9 @@ class Search:
     page: int
     cols: tuple[str, ...]
     """The columns asked for, unchecked: each engine knows its own columns."""
+    expand: bool = False
+    """The request asked for synonyms. The engine looks them up into `synonyms`."""
+    synonyms: Synonyms = field(default_factory=dict)
 
     @classmethod
     def parse(cls, query: ArctosQuery, known: Collection[str]) -> "Search":
@@ -250,11 +285,16 @@ class Search:
             tab=tab,
             page=query.page or 1,
             cols=_present((query.cols or "").split(",")),
+            expand=query.synonyms,
         )
 
     @property
     def constrains_relations(self) -> bool:
         return any(row.constrains_relations for row in self.taxa)
+
+    def names(self, rank: str, name: str) -> tuple[str, ...]:
+        """`name` and the synonyms it also matches at `rank`."""
+        return (name, *(self.synonyms.get((rank, name)) or ()))
 
     def relationships(self) -> tuple[str, ...]:
         """The relationships the rows name, deduplicated, in the order they were
@@ -270,7 +310,7 @@ class Search:
         """The taxon, attribute and part rows, each as a clause."""
         parts: list[str] = []
         if self.taxa:
-            parts.append(", or ".join(row.describe() for row in self.taxa))
+            parts.append(", or ".join(row.describe(self.synonyms) for row in self.taxa))
         if self.attrs:
             rows = f" {self.attr_op} ".join(row.describe() for row in self.attrs)
             parts.append(f"with {rows}" + (f' by a method containing "{self.method}"' if self.method else ""))

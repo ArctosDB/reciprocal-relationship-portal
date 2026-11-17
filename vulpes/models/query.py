@@ -9,8 +9,13 @@ class ArctosQuery(BaseModel):
 
     taxon: list[str] | None = None
     """Taxon rows, `rank|name`, `rank|name|relationships`, or that followed by
-    `rank|name` pairs for Related taxa. Rows OR together. A literal `|` is
-    written `\\|`."""
+    `rank|name` pairs for Related taxa. Rows OR together. The relationship
+    `null` takes records related to nothing, ORing with the row's others. A
+    literal `|` is written `\\|`."""
+    synonyms: bool = False
+    """Also match the synonyms the Catalogue of Life lists for each taxon a
+    `taxon` row names, its own or a Related one, and the accepted name when the
+    row names a synonym."""
     attr: list[str] | None = None
     """Attribute rows, `[!]type|value|value…`. A leading `!` negates the row.
     A type with no value asks only whether the record carries it. `null` asks

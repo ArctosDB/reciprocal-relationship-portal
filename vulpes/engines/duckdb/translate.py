@@ -235,7 +235,10 @@ class Translator:
         relation_rows = [row for row in search.taxa if row.constrains_relations]
         self._edges = self._edges_cte(relation_rows) if relation_rows else None
 
-        taxon = [self._taxon("r", row.rank, row.name) for row in search.taxa if not row.constrains_relations]
+        plain = [row for row in search.taxa if not (row.constrains_relations or row.unrelated)]
+        taxon = [self._taxon("r", row.rank, row.name) for row in plain]
+        # A `null` relationship ORs with the row's others, which the edges below carry.
+        taxon += [self._unrelated(row) for row in search.taxa if row.unrelated]
         if relation_rows:
             taxon.append("r.collection_object_id IN (SELECT src_id FROM edges)")
         self._taxon_block = _any(taxon) if taxon else None
@@ -271,23 +274,26 @@ class Translator:
         return f"(contains(lower({col}), lower({self._bind(longest)})) AND regexp_matches({col}, {self._bind(pattern)}))"
 
     def _taxon(self, alias: str, rank: str, name: str) -> str:
+        """The name, or any synonym the search found for it."""
+        names = self.search.names(rank, name)
         if rank == "scientific_name":
-            return self._phrase(f"{alias}.scientific_name", name)
+            return _any([self._phrase(f"{alias}.scientific_name", n) for n in names])
         col = f"{alias}.{RANK_COLUMNS[rank]}"
-        value = f"lower({self._bind(name)})"
+        values = self._lowered(names)
         return (
-            f"(lower({col}) = {value} OR (contains({col}, ';') AND list_contains("
-            f"list_transform(string_split(lower({col}), ';'), lambda x: trim(x)), {value})))"
+            f"(lower({col}) IN ({values}) OR (contains({col}, ';') AND list_has_any("
+            f"list_transform(string_split(lower({col}), ';'), lambda x: trim(x)), [{values}])))"
         )
 
     def _related(self, rank: str, name: str) -> str:
         """A Related taxon, tested on one edge `e`."""
         resolved = f"e.dst_id IN (SELECT d.collection_object_id FROM records d WHERE {self._taxon('d', rank, name)})"
         # An edge pointing outside the database carries only what Arctos cached.
+        names = self.search.names(rank, name)
         if rank == "scientific_name":
-            return f"({resolved} OR {self._phrase('e.dst_identification', name)})"
+            return _any([resolved, *(self._phrase("e.dst_identification", n) for n in names)])
         if rank == "family":
-            return f"({resolved} OR (e.dst_id IS NULL AND lower(e.dst_family) = lower({self._bind(name)})))"
+            return f"({resolved} OR (e.dst_id IS NULL AND lower(e.dst_family) IN ({self._lowered(names)})))"
         return resolved
 
     def _edge(self, row: TaxonRow) -> str:
@@ -300,6 +306,15 @@ class Translator:
             clauses.append(f"e.src_id IN (SELECT s.collection_object_id FROM records s WHERE {specimen})")
         if row.related:
             clauses.append(_any([self._related(rank, name) for rank, name in row.related]))
+        return "(" + _all(clauses) + ")"
+
+    def _unrelated(self, row: TaxonRow) -> str:
+        """The row's own taxon, on records with no relationship at all: no link of
+        their own, and none from another record pointing at them."""
+        clauses = [self._taxon("r", row.rank, row.name)] if row.name else []
+        clauses.append("r.collection_object_id NOT IN (SELECT src_id FROM related_records)")
+        # NOT IN is empty against a NULL, and a link leaving the database has no dst_id.
+        clauses.append("r.collection_object_id NOT IN (SELECT dst_id FROM related_records WHERE dst_id IS NOT NULL)")
         return "(" + _all(clauses) + ")"
 
     def _edges_cte(self, rows: Sequence[TaxonRow]) -> str:

@@ -102,6 +102,28 @@ def test_a_row_reaches_only_through_the_records_its_own_taxon_selects(engine: Du
     assert [(r["guid"], r["related_guid"]) for r in results.records] == [(SHREW_AGAIN, [CESTODE]), (SHREW, [CESTODE])]
 
 
+def test_a_null_relationship_takes_records_related_to_nothing(engine: DuckDbQueryEngine) -> None:
+    # The tick has no link of its own, but the mouse's points at it.
+    assert guids(engine, taxon=["||null"]) == [OTHER_SHREW]
+    assert guids(engine, taxon=["genus|Sorex|null"]) == [OTHER_SHREW]
+    assert guids(engine, taxon=["genus|Peromyscus|null"]) == []
+    # It ORs with the row's other relationships, and only those reach anything.
+    results = run(engine, taxon=["genus|Sorex|null; host of parasite"])
+    assert [(r["guid"], r.get("related_guid")) for r in results.records] == [
+        (OTHER_SHREW, None),
+        (SHREW_AGAIN, [CESTODE]),
+        (SHREW, [CESTODE]),
+    ]
+    # Nothing a record is related to can be a related taxon.
+    with pytest.raises(BadQueryError):
+        run(engine, taxon=["genus|Sorex|null|class|Cestoda"])
+    # `null` is no relationship to view.
+    assert run(engine, taxon=["genus|Sorex|null"]).column_order[:2] == ["guid", "scientific_name"]
+    summary = engine.summary(ArctosQuery(taxon=["genus|Sorex|null; host of parasite"]))
+    assert summary.description == "Genus Sorex with relationship host of parasite, or with no relationships."
+    assert [block.relation for block in summary.related] == ["host of parasite"]
+
+
 # ---- attributes and parts -------------------------------------------------
 
 

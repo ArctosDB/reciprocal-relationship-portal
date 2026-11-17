@@ -1,7 +1,10 @@
+import logging
 import tempfile
 from collections import defaultdict
 from collections.abc import Callable, Iterator, Sequence
+from dataclasses import replace
 from datetime import UTC, date, datetime
+from functools import lru_cache
 from pathlib import Path
 from typing import Any, override
 
@@ -38,7 +41,14 @@ from vulpes.models.responses import (
     TypedFacet,
     Years,
 )
-from vulpes.models.search import DETECTION_FIELDS, BadQueryError, Search
+from vulpes.models.search import DETECTION_FIELDS, RANK_COLUMNS, RANKS, BadQueryError, Rank, Search
+from vulpes.synonyms import Classification, Synonyms, SynonymsUnavailableError
+
+logger = logging.getLogger(__name__)
+
+MAX_CLASSIFICATIONS = 3
+"""The most classifications of one name matched, each one more request. Past
+the commonest few, the rest are mostly misfiled records."""
 
 
 def _compact(value: Any) -> Any:  # noqa: ANN401
@@ -51,9 +61,11 @@ def _compact(value: Any) -> Any:  # noqa: ANN401
 
 
 class DuckDbQueryEngine(QueryEngine):
-    def __init__(self, path: str, code_tables: Path | None = None) -> None:
+    def __init__(self, path: str, code_tables: Path | None = None, synonyms: Synonyms | None = None) -> None:
         """`code_tables` is the directory of Arctos code tables, by default the
-        `code-tables` directory beside the database."""
+        `code-tables` directory beside the database. `synonyms` answers a search
+        asking for them; without it, such a search notes they are unavailable."""
+        self._synonyms = synonyms
         self.name = "duckdb"
         self.path = path
         # Read-only: the file is replaced whole by the importer, never written here.
@@ -89,7 +101,52 @@ class DuckDbQueryEngine(QueryEngine):
         return datetime.fromtimestamp(Path(self.path).stat().st_mtime, tz=UTC).date()
 
     def _parse(self, query: ArctosQuery) -> Search:
-        return Search.parse(query, self.relationships)
+        search = Search.parse(query, self.relationships)
+        if not search.expand:
+            return search
+        taxa = dict.fromkeys(taxon for row in search.taxa for taxon in row.taxa())
+        return replace(search, synonyms={(rank, name): self._synonyms_of(rank, name) for rank, name in taxa})
+
+    def _synonyms_of(self, rank: str, name: str) -> tuple[str, ...] | None:
+        """The other names Catalogue of Life gives the taxon `name` names.
+        `None` when they could not be looked up."""
+        if self._synonyms is None:
+            return None
+        key = " ".join(name.lower().split())
+        # A name the snapshot files under several classifications, a homonym
+        # in Arctos itself, is matched once under each.
+        classifications = self._classifications(rank, key) or ((),)
+        try:
+            found = [
+                self._synonyms.lookup(None if rank == "scientific_name" else rank, key, classification)
+                for classification in classifications
+            ]
+        except SynonymsUnavailableError as e:
+            logger.warning("synonyms of %s %r unavailable: %s", rank, name, e)
+            return None
+        return tuple(dict.fromkeys(n for names in found for n in names if n.lower() != key))
+
+    @lru_cache(maxsize=4096)  # noqa: B019 - the engine lives as long as the process
+    def _classifications(self, rank: str, name: str) -> tuple[Classification, ...]:
+        """The higher classifications the snapshot's records of `name`, lowercased,
+        carry at `rank`, most common first, as hints for ChecklistBank's matcher.
+        A scientific name counts the records whose name starts with it."""
+        if rank == "scientific_name":
+            above: tuple[Rank, ...] = RANKS[:-1]
+            where = "starts_with(lower(scientific_name), $name)"
+        else:
+            above = RANKS[: next(i for i, r in enumerate(RANKS) if r.id == rank)]
+            column = RANK_COLUMNS[rank]
+            where = f"list_contains(list_transform(string_split(lower({column}), ';'), lambda x: trim(x)), $name)"
+        if not above:
+            return ()
+        # A rank column joining several determinations offers its first.
+        picked = ", ".join(f"nullif(trim(split_part({r.column}, ';', 1)), '')" for r in above)
+        sql = f"""SELECT {picked} FROM records WHERE {where}
+            GROUP BY ALL ORDER BY count(*) DESC LIMIT {MAX_CLASSIFICATIONS}"""  # noqa: S608
+        with self.conn.cursor() as cursor:
+            rows = cursor.execute(sql, {"name": name}).fetchall()
+        return tuple(tuple((r.id, v) for r, v in zip(above, row, strict=True) if v) for row in rows)
 
     def _columns(self, search: Search, default: Sequence[str], *, related: bool) -> list[str]:
         """The columns of a page or an export, in order. `related` says whether

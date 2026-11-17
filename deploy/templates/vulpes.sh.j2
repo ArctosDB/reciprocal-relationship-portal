@@ -93,7 +93,8 @@ import_flat() {
     fi
     csv=$(readlink -f "$csv")
     "$RELEASE_DIR/.venv/bin/python" "$RELEASE_DIR/importer/build_duckdb.py" "$csv" \
-        --out-dir "$(dirname "$DUCKDB_PATH")"
+        --out-dir "$(dirname "$DUCKDB_PATH")" \
+        --memory-limit 6GB  # leaves the running app room in the server's 10 GiB
     if is_running; then
         reload
     fi

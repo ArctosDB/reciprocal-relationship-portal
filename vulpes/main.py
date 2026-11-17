@@ -1,14 +1,14 @@
 import os
 from pathlib import Path
 
-from fastapi import APIRouter, FastAPI, Request
+from fastapi import APIRouter, FastAPI
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.middleware.gzip import GZipMiddleware
-from fastapi.responses import JSONResponse
 
+from vulpes import errors
 from vulpes.engines.duckdb import DuckDbQueryEngine
-from vulpes.models.search import BadQueryError
 from vulpes.routes.router import make_router
+from vulpes.synonyms import DEFAULT_DATASET, Synonyms
 
 app = FastAPI(
     title="Arctos Reciprocal Relationship Portal",
@@ -18,11 +18,8 @@ Search portal for querying nested Arctos parasite/pathogen attributes, parts, an
 )
 
 
-@app.exception_handler(BadQueryError)
-def bad_query(_request: Request, error: BadQueryError) -> JSONResponse:
-    """A row outside the grammar is a 400 in the envelope the portal reads: it
-    shows `message` where the failed call's result would have gone."""
-    return JSONResponse({"error": "Bad Request", "message": str(error)}, status_code=400)
+# The portal shows an error's `message` where the failed call's result would have gone.
+errors.install(app)
 
 
 router = APIRouter()
@@ -41,6 +38,8 @@ app.include_router(
         DuckDbQueryEngine(
             os.environ.get("DUCKDB_PATH") or "../shared/data/arctos.duckdb",
             Path(code_tables) if code_tables else None,
+            # The ChecklistBank dataset synonyms come from, a Catalogue of Life release.
+            Synonyms(os.environ.get("CHECKLISTBANK_DATASET") or DEFAULT_DATASET),
         )
     ),
     prefix="/api/duckdb",
