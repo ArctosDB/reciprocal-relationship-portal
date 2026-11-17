@@ -17,6 +17,7 @@ from typing import Any
 
 import duckdb
 
+from vulpes.engines.duckdb.translate import DEFAULT_COLUMNS
 from vulpes.models.responses import (
     AttributeType,
     Facet,
@@ -144,6 +145,7 @@ def build(cursor: duckdb.DuckDBPyConnection, directory: Path, columns: Sequence[
     return Schema(
         snapshot_date=snapshot,
         columns=list(columns),
+        default_columns=list(DEFAULT_COLUMNS),
         ranks=ranks,
         attribute_types=sorted(
             (

@@ -152,20 +152,33 @@ class AttrRow:
     type: str
     values: tuple[str, ...]
     negated: bool
+    any: bool = False
+    """The row is `null` or `!null` and names no type: it asks whether the
+    record has any row at all. `null` is the negated form, "has none"."""
 
     @classmethod
-    def parse(cls, raw: str) -> "AttrRow":
+    def parse(cls, raw: str, field: str = "attr") -> "AttrRow":
         """`[!]type|value|value…`. The `!` sits before the escaped type and is not
-        itself escaped. A type with no value asks only whether the record has it."""
+        itself escaped. A type with no value asks only whether the record has it.
+        `null` asks for records with no row, `!null` for those with any."""
         negated = raw.startswith("!")
         atype, *values = split_pipes(raw.removeprefix("!"))
+        values = [v for v in values if v]
+        if atype.lower() == "null":
+            if values:
+                msg = f"`{field}` row `null` takes no values"
+                raise BadQueryError(msg)
+            return cls(raw, atype, (), negated=not negated, any=True)
         if not atype:
-            msg = "`attr` carries an empty attribute type"
+            msg = f"`{field}` carries an empty type"
             raise BadQueryError(msg)
-        return cls(raw, atype, tuple(v for v in values if v), negated)
+        return cls(raw, atype, tuple(values), negated)
 
-    def describe(self) -> str:
-        """`sex male or female`, `no sex recorded`, `detected recorded`."""
+    def describe(self, noun: str = "attributes") -> str:
+        """`sex male or female`, `no sex recorded`, `detected recorded`, and for
+        `null` rows `no attributes` or `any attributes`."""
+        if self.any:
+            return f"{'no' if self.negated else 'any'} {noun}"
         prefix = "no " if self.negated else ""
         if not self.values:
             return f"{prefix}{self.type} recorded"
@@ -173,8 +186,8 @@ class AttrRow:
 
     @classmethod
     def parse_part(cls, raw: str) -> "AttrRow":
-        row = cls.parse(raw)
-        if row.type not in PART_FIELDS:
+        row = cls.parse(raw, "part")
+        if not row.any and row.type not in PART_FIELDS:
             msg = f"`part` names `{row.type}`, which is not a searchable part field"
             raise BadQueryError(msg)
         return row
@@ -261,8 +274,9 @@ class Search:
         if self.attrs:
             rows = f" {self.attr_op} ".join(row.describe() for row in self.attrs)
             parts.append(f"with {rows}" + (f' by a method containing "{self.method}"' if self.method else ""))
-        if self.parts:
-            parts.append("having parts with " + " and ".join(row.describe() for row in self.parts))
+        parts.extend(f"with {row.describe('parts')}" for row in self.parts if row.any)
+        if fields := [row for row in self.parts if not row.any]:
+            parts.append("having parts with " + " and ".join(row.describe() for row in fields))
         return parts
 
     def _describe_scope(self) -> list[str]:

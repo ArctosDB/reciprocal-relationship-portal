@@ -12,9 +12,6 @@ tracer = trace.get_tracer(__name__)
 
 MAPPER_CONFIG = (Path(__file__).parent.parent / "config" / "berkeleymapper.xml").read_bytes()
 
-# Nothing an engine answers changes until the service restarts on a new
-# snapshot, so a browser may reuse an answer instead of asking again. The
-# portal asks for the same search again on every tab switch.
 SEARCH_CACHE = "public, max-age=300"
 SCHEMA_CACHE = "public, max-age=900"
 

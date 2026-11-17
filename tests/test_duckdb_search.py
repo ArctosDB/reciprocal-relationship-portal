@@ -143,6 +143,22 @@ def test_part_rows_and_together(engine: DuckDbQueryEngine) -> None:
     assert guids(engine, part=["part_barcode|A100"]) == [SHREW]
 
 
+def test_null_rows_ask_whether_a_record_has_any_attribute_or_part(engine: DuckDbQueryEngine) -> None:
+    assert guids(engine, attr=["null"]) == [CESTODE, TICK]
+    assert guids(engine, attr=["!null"]) == [OTHER_SHREW, SHREW_AGAIN, SHREW, MOUSE]
+    assert guids(engine, part=["null"]) == [OTHER_SHREW, SHREW_AGAIN, CESTODE, TICK]
+    assert guids(engine, part=["!null"]) == [SHREW, MOUSE]
+    # They combine like any other row.
+    assert guids(engine, attr=["!null"], part=["null"]) == [OTHER_SHREW, SHREW_AGAIN]
+    assert guids(engine, attr=["null", "weight"], attr_op="or") == [MOUSE, CESTODE, TICK]
+    # `!null` with a method: any attribute determined that way.
+    assert guids(engine, attr=["!null"], method="necropsy") == [SHREW]
+    summary = engine.summary(ArctosQuery(attr=["null"], part=["!null"]))
+    assert summary.description == "With no attributes with any parts."
+    with pytest.raises(BadQueryError):
+        run(engine, attr=["null|x"])
+
+
 # ---- scope ----------------------------------------------------------------
 
 

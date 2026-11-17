@@ -311,27 +311,31 @@ class Translator:
 
     def _attribute(self, row: AttrRow) -> str:
         """Whether the record carries the row's attribute. A value is exact,
-        several values OR, and no value asks only for the type."""
-        clauses = [f"lower(a.attribute_type) = lower({self._bind(row.type)})"]
+        several values OR, and no value asks only for the type. A `null` row
+        asks for any attribute at all."""
+        clauses = [] if row.any else [f"lower(a.attribute_type) = lower({self._bind(row.type)})"]
         if row.values:
             clauses.append(f"lower(a.attribute_value) IN ({self._lowered(row.values)})")
         if self.search.method:
             # The method and the value must be the same attribute's.
             clauses.append(self._method())
-        return f"r.collection_object_id IN (SELECT a.id FROM attributes a WHERE {_all(clauses)})"
+        where = f" WHERE {_all(clauses)}" if clauses else ""
+        return f"r.collection_object_id IN (SELECT a.id FROM attributes a{where})"
 
     def _method(self) -> str:
         return f"contains(lower(a.attribute_method), lower({self._bind(self.search.method)}))"
 
     def _part(self, row: AttrRow) -> str:
         col = f"p.{row.type}"  # one of PART_FIELDS, checked by the parse
+        negation = "NOT " if row.negated else ""
+        if row.any:
+            return f"r.collection_object_id {negation}IN (SELECT p.id FROM parts p)"
         if not row.values:
             clause = f"{col} IS NOT NULL"
         elif row.type == "part_barcode":
             clause = f"{col} IN ({', '.join(self._bind(v) for v in row.values)})"
         else:
             clause = f"lower({col}) IN ({self._lowered(row.values)})"
-        negation = "NOT " if row.negated else ""
         return f"r.collection_object_id {negation}IN (SELECT p.id FROM parts p WHERE {clause})"
 
     def _dated(self, col: str) -> str:

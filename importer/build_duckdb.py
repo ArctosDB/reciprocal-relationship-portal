@@ -591,7 +591,7 @@ def convert_csv(csv, parquet, temp_dir):
 
 def snapshot_date(csv):
     """The export day in the CSV's name: filtered_flat-2026_17_7.csv is 17 July 2026."""
-    match = re.search(r"(\d{4})_(\d{1,2})_(\d{1,2})", csv.name)
+    match = re.search(r"(\d{4})[_-](\d{1,2})[_-](\d{1,2})", csv.name)
     if not match:
         raise SystemExit(f"no year_day_month date in the name of {csv.name}; pass --snapshot-date")
     year, day, month = map(int, match.groups())

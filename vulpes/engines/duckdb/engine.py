@@ -61,7 +61,7 @@ class DuckDbQueryEngine(QueryEngine):
         self.conn = duckdb.connect(path, read_only=True)
 
         # The schema never changes while the process runs: the importer swaps
-        # in a whole new file, and the service is restarted to read it.
+        # in a whole new file, and `vulpes.sh reload` replaces the workers to read it.
         with self.conn.cursor() as cursor:
             self.record_columns: tuple[str, ...] = tuple(r[0] for r in cursor.execute("DESCRIBE records").fetchall())
             self._schema = build_schema(

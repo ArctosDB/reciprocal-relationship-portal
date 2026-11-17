@@ -13,12 +13,14 @@ class ArctosQuery(BaseModel):
     written `\\|`."""
     attr: list[str] | None = None
     """Attribute rows, `[!]type|value|value…`. A leading `!` negates the row.
-    A type with no value asks only whether the record carries it."""
+    A type with no value asks only whether the record carries it. `null` asks
+    for records with no attributes at all, `!null` for those with any."""
     part: list[str] | None = None
     """This field holds part rows, `[!]field|value|value…`, the same grammar as
     `attr`. The field names a part field rather than an attribute type,
     because a part carries its values in named fields, not in type/value
-    pairs. Rows always AND; `attr_op` does not reach them."""
+    pairs. `null` and `!null` ask for records with no parts or with any. Rows
+    always AND; `attr_op` does not reach them."""
     prefix: list[str] | None = None
     """Collection prefixes, `MSB:Mamm`. Values OR together."""
     country: list[str] | None = None

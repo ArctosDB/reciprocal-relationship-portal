@@ -68,6 +68,9 @@ class Schema(ResponseModel):
     snapshot_date: date
     columns: list[str]
     """Every column a download may name in `cols`, in dump order."""
+    default_columns: list[str]
+    """The columns of a search page that names none in `cols`. A search that
+    constrains relations also gets the related columns, after `guid`."""
     ranks: list[Rank]
     """The ranks that hold values, `scientific_name` first."""
     attribute_types: list[AttributeType]

@@ -6,7 +6,10 @@
 # settings from shared/env and shared/secrets.env.
 #
 # Usage:
-#   vulpes.sh start|stop|restart|status
+#   vulpes.sh start|stop|restart|reload|status
+#   vulpes.sh import filtered_flat-YYYY_DD_MM.csv   rebuild the database, then reload if running
+#
+# reload swaps in fresh workers without downtime, e.g. to pick up a rebuilt database.
 #
 # Acts on the release that "current" points to, unless RELEASE_DIR is set.
 
@@ -16,6 +19,7 @@ APP_ROOT={{ app_root }}
 RELEASE_DIR=$(readlink -f "${RELEASE_DIR:-$APP_ROOT/current}")
 PIDFILE=$APP_ROOT/shared/uvicorn.pid
 LOG_DIR=$APP_ROOT/shared/log
+WORKERS={{ uvicorn_workers }}
 
 set -a
 . "$APP_ROOT/shared/env"
@@ -37,7 +41,8 @@ start() {
     setsid nohup "$RELEASE_DIR/.venv/bin/uvicorn" vulpes.main:app \
         --host {{ uvicorn_host }} \
         --port {{ uvicorn_port }} \
-        --workers {{ uvicorn_workers }} \
+        --workers "$WORKERS" \
+        --timeout-worker-healthcheck 60 \
         --root-path {{ root_path }} \
         --proxy-headers \
         --forwarded-allow-ips '*' \
@@ -76,16 +81,50 @@ stop() {
     exit 1
 }
 
-# TODO case for rebuilding duckdb database from a flat export
+import_flat() {
+    local csv=${1:-}
+    if [[ -z $csv ]]; then
+        echo "usage: $0 import filtered_flat-YYYY_DD_MM.csv" >&2
+        exit 2
+    fi
+    if [[ ! -f $csv ]]; then
+        echo "no such file: $csv" >&2
+        exit 1
+    fi
+    csv=$(readlink -f "$csv")
+    "$RELEASE_DIR/.venv/bin/python" "$RELEASE_DIR/importer/build_duckdb.py" "$csv" \
+        --out-dir "$(dirname "$DUCKDB_PATH")"
+    if is_running; then
+        reload
+    fi
+}
+
+# Reloads the workers one at a time so the app keeps serving
+reload() {
+    if ! is_running; then
+        echo "not running"
+        return
+    fi
+    if (( WORKERS < 2 )); then
+        stop
+        start
+        return
+    fi
+    kill -HUP "$(cat "$PIDFILE")"
+    echo "reloading workers; see $LOG_DIR/vulpes.log"
+}
+
 case "${1:-}" in
     start) start ;;
     stop) stop ;;
     restart) stop; start ;;
+    reload) reload ;;
     status)
         if is_running; then echo "running (pid $(cat "$PIDFILE"))"; else echo "not running"; fi
         ;;
+    import) import_flat "${2:-}" ;;
     *)
-        echo "usage: $0 start|stop|restart|status" >&2
+        echo "usage: $0 start|stop|restart|reload|status|import <flat-export.csv>" >&2
         exit 2
         ;;
 esac
