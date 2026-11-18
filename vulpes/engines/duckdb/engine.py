@@ -1,4 +1,3 @@
-import logging
 import tempfile
 from collections import defaultdict
 from collections.abc import Callable, Iterator, Sequence
@@ -36,15 +35,14 @@ from vulpes.models.responses import (
     SearchSummary,
     Stats,
     Summary,
+    SynonymSource,
     Taxon,
     Total,
     TypedFacet,
     Years,
 )
 from vulpes.models.search import DETECTION_FIELDS, RANK_COLUMNS, RANKS, BadQueryError, Rank, Search
-from vulpes.synonyms import Classification, Synonyms, SynonymsUnavailableError
-
-logger = logging.getLogger(__name__)
+from vulpes.synonyms import Classification, Expansion, Synonyms
 
 MAX_CLASSIFICATIONS = 3
 """The most classifications of one name matched, each one more request. Past
@@ -104,27 +102,10 @@ class DuckDbQueryEngine(QueryEngine):
         search = Search.parse(query, self.relationships)
         if not search.expand:
             return search
-        taxa = dict.fromkeys(taxon for row in search.taxa for taxon in row.taxa())
-        return replace(search, synonyms={(rank, name): self._synonyms_of(rank, name) for rank, name in taxa})
-
-    def _synonyms_of(self, rank: str, name: str) -> tuple[str, ...] | None:
-        """The other names Catalogue of Life gives the taxon `name` names.
-        `None` when they could not be looked up."""
+        taxa = [taxon for row in search.taxa for taxon in row.taxa()]
         if self._synonyms is None:
-            return None
-        key = " ".join(name.lower().split())
-        # A name the snapshot files under several classifications, a homonym
-        # in Arctos itself, is matched once under each.
-        classifications = self._classifications(rank, key) or ((),)
-        try:
-            found = [
-                self._synonyms.lookup(None if rank == "scientific_name" else rank, key, classification)
-                for classification in classifications
-            ]
-        except SynonymsUnavailableError as e:
-            logger.warning("synonyms of %s %r unavailable: %s", rank, name, e)
-            return None
-        return tuple(dict.fromkeys(n for names in found for n in names if n.lower() != key))
+            return replace(search, synonyms=Expansion(dict.fromkeys(taxa)))
+        return replace(search, synonyms=self._synonyms.expand(taxa, self._classifications))
 
     @lru_cache(maxsize=4096)  # noqa: B019 - the engine lives as long as the process
     def _classifications(self, rank: str, name: str) -> tuple[Classification, ...]:
@@ -348,7 +329,12 @@ class DuckDbQueryEngine(QueryEngine):
             for grp in (*named, *sorted(reached.values()))
         ]
 
-        return SearchSummary(records=Stats(**stats(None)), related=related, description=search.description())
+        return SearchSummary(
+            records=Stats(**stats(None)),
+            related=related,
+            description=search.description(),
+            sources=[SynonymSource(**source._asdict(), names=list(names)) for source, names in search.synonyms.sources],
+        )
 
     @override
     def taxa(self, q: str, rank: str | None, limit: int) -> list[Taxon]:

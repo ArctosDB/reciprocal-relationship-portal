@@ -187,6 +187,21 @@ class RelationStats(Stats):
     before the related records collapse to distinct records."""
 
 
+class SynonymSource(ResponseModel):
+    """A ChecklistBank dataset the synonyms of a search came from."""
+
+    key: int
+    """Its ChecklistBank dataset key: `https://www.checklistbank.org/dataset/<key>`."""
+    alias: str | None
+    title: str | None
+    version: str | None
+    doi: str | None
+    citation: str | None
+    """Plain text, ready to cite."""
+    names: list[str]
+    """The synonyms it supplied to this search."""
+
+
 class SearchSummary(ResponseModel):
     records: Stats
     """Statistics over the set `/search` matches."""
@@ -196,6 +211,10 @@ class SearchSummary(ResponseModel):
     reached without naming. Empty when the query constrains no relation."""
     description: str | None
     """One sentence restating the query. `null` for an empty form."""
+    sources: list[SynonymSource] = []
+    """With `synonyms`, the Catalogue of Life release they were read from, with
+    every name added, then each dataset the release took those names from.
+    Empty when no synonym was added."""
 
 
 class Taxon(ResponseModel):

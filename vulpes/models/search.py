@@ -5,12 +5,13 @@ grammar can raise. Each engine translates the parsed `Search`, so no engine
 re-reads the raw rows.
 """
 
-from collections.abc import Collection, Iterable, Mapping
+from collections.abc import Collection, Iterable
 from dataclasses import dataclass, field
 from datetime import date
 from typing import Literal, NamedTuple
 
 from vulpes.models.query import ArctosQuery
+from vulpes.synonyms import Expansion, Names
 
 
 class Rank(NamedTuple):
@@ -85,12 +86,7 @@ def _check_rank(rank: str) -> None:
         raise BadQueryError(msg)
 
 
-Synonyms = Mapping[tuple[str, str], tuple[str, ...] | None]
-"""The other names each `(rank, name)` of the taxon rows also matches. `None`
-says the lookup failed, and the name matches alone."""
-
-
-def _describe_taxon(rank: str, name: str, synonyms: Synonyms) -> str:
+def _describe_taxon(rank: str, name: str, synonyms: Names) -> str:
     text = name if rank == "scientific_name" else f"{rank} {name}"
     found = synonyms.get((rank, name), ())
     if found is None:
@@ -165,7 +161,7 @@ class TaxonRow:
             yield self.rank, self.name
         yield from self.related
 
-    def describe(self, synonyms: Synonyms) -> str:
+    def describe(self, synonyms: Names) -> str:
         """This row in plain English, for `Search.description`."""
         text = _describe_taxon(self.rank, self.name, synonyms) if self.name else "any record"
         if self.relationships:
@@ -259,7 +255,7 @@ class Search:
     """The columns asked for, unchecked: each engine knows its own columns."""
     expand: bool = False
     """The request asked for synonyms. The engine looks them up into `synonyms`."""
-    synonyms: Synonyms = field(default_factory=dict)
+    synonyms: Expansion = field(default_factory=Expansion)
 
     @classmethod
     def parse(cls, query: ArctosQuery, known: Collection[str]) -> "Search":
@@ -294,7 +290,7 @@ class Search:
 
     def names(self, rank: str, name: str) -> tuple[str, ...]:
         """`name` and the synonyms it also matches at `rank`."""
-        return (name, *(self.synonyms.get((rank, name)) or ()))
+        return (name, *(self.synonyms.names.get((rank, name)) or ()))
 
     def relationships(self) -> tuple[str, ...]:
         """The relationships the rows name, deduplicated, in the order they were
@@ -310,7 +306,7 @@ class Search:
         """The taxon, attribute and part rows, each as a clause."""
         parts: list[str] = []
         if self.taxa:
-            parts.append(", or ".join(row.describe(self.synonyms) for row in self.taxa))
+            parts.append(", or ".join(row.describe(self.synonyms.names) for row in self.taxa))
         if self.attrs:
             rows = f" {self.attr_op} ".join(row.describe() for row in self.attrs)
             parts.append(f"with {rows}" + (f' by a method containing "{self.method}"' if self.method else ""))
