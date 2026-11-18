@@ -1,3 +1,4 @@
+from collections.abc import Iterable
 from datetime import date
 from typing import Any, Literal
 
@@ -187,8 +188,8 @@ class RelationStats(Stats):
     before the related records collapse to distinct records."""
 
 
-class SynonymSource(ResponseModel):
-    """A ChecklistBank dataset the synonyms of a search came from."""
+class Checklist(ResponseModel):
+    """A dataset on ChecklistBank."""
 
     key: int
     """Its ChecklistBank dataset key: `https://www.checklistbank.org/dataset/<key>`."""
@@ -198,8 +199,73 @@ class SynonymSource(ResponseModel):
     doi: str | None
     citation: str | None
     """Plain text, ready to cite."""
-    names: list[str]
-    """The synonyms it supplied to this search."""
+
+
+class TaxonName(ResponseModel):
+    name: str
+    authorship: str | None
+    """`Pallas, 1811`."""
+    link: str | None
+    """The name's page at the checklist it came from, e.g. its ITIS record,
+    which lists the references behind it."""
+    source: int | None
+    """The `key` of the checklist in `Synonymy.sources` it came from. `null`
+    for a name the release's editors added themselves."""
+
+
+class AcceptedName(TaxonName):
+    references: list[str]
+    """What its checklist cites for it."""
+
+
+class TaxonSynonymy(ResponseModel):
+    """What one searched taxon turned out to be."""
+
+    rank: str
+    name: str
+    """As searched."""
+    status: Literal["accepted", "synonym", "unmatched", "unavailable"]
+    """`accepted`: the name is the accepted one. `synonym`: `accepted` names the
+    taxon it is a synonym of. `unmatched`: the release does not know the name,
+    and it was searched alone. `unavailable`: ChecklistBank could not be asked,
+    and it was searched alone."""
+    accepted: AcceptedName | None
+    synonyms: list[TaxonName]
+    """Every synonym of the accepted name, the searched name among them when it
+    is one. All were searched for."""
+
+    @property
+    def added(self) -> tuple[str, ...]:
+        """The names the search also matches: the accepted name and every
+        synonym, but the name itself."""
+        names = [n.name for n in (self.accepted, *self.synonyms) if n is not None]
+        return tuple(dict.fromkeys(n for n in names if n.lower() != self.name.lower()))
+
+
+class Synonymy(ResponseModel):
+    release: Checklist | None
+    """The Catalogue of Life release every name was read from. `null` when no
+    name matched."""
+    taxa: list[TaxonSynonymy]
+    """One per searched taxon, or more when the records file one name under
+    classifications the release places in different taxa."""
+    sources: list[Checklist]
+    """The checklists the release took the names from, by `key`."""
+
+    @classmethod
+    def unavailable(cls, taxa: Iterable[tuple[str, str]]) -> "Synonymy":
+        """Every `(rank, name)` searched alone, the release not asked."""
+        found = [
+            TaxonSynonymy(rank=r, name=n, status="unavailable", accepted=None, synonyms=[]) for r, n in dict.fromkeys(taxa)
+        ]
+        return cls(release=None, taxa=found, sources=[])
+
+    def of(self, rank: str, name: str) -> list[TaxonSynonymy]:
+        return [t for t in self.taxa if (t.rank, t.name) == (rank, name)]
+
+    def names(self, rank: str, name: str) -> tuple[str, ...]:
+        """The other names `(rank, name)` also matches."""
+        return tuple(dict.fromkeys(n for t in self.of(rank, name) for n in t.added))
 
 
 class SearchSummary(ResponseModel):
@@ -211,10 +277,9 @@ class SearchSummary(ResponseModel):
     reached without naming. Empty when the query constrains no relation."""
     description: str | None
     """One sentence restating the query. `null` for an empty form."""
-    sources: list[SynonymSource] = []
-    """With `synonyms`, the Catalogue of Life release they were read from, with
-    every name added, then each dataset the release took those names from.
-    Empty when no synonym was added."""
+    synonyms: Synonymy | None = None
+    """What the taxa searched are according to the Catalogue of Life, and whom
+    it follows. `null` unless the query asked for `synonyms`."""
 
 
 class Taxon(ResponseModel):

@@ -5,13 +5,13 @@ grammar can raise. Each engine translates the parsed `Search`, so no engine
 re-reads the raw rows.
 """
 
-from collections.abc import Collection, Iterable
-from dataclasses import dataclass, field
+from collections.abc import Callable, Collection, Iterable
+from dataclasses import dataclass
 from datetime import date
 from typing import Literal, NamedTuple
 
 from vulpes.models.query import ArctosQuery
-from vulpes.synonyms import Expansion, Names
+from vulpes.models.responses import Synonymy
 
 
 class Rank(NamedTuple):
@@ -86,14 +86,25 @@ def _check_rank(rank: str) -> None:
         raise BadQueryError(msg)
 
 
-def _describe_taxon(rank: str, name: str, synonyms: Names) -> str:
+Resolve = Callable[[list[tuple[str, str]]], Synonymy]
+"""Looks up what each searched `(rank, name)` is, for a query asking for synonyms."""
+
+
+def _describe_taxon(rank: str, name: str, synonyms: Synonymy | None) -> str:
+    """`genus Myodes (also Clethrionomys, …)`, and for a synonym `genus
+    Clethrionomys (accepted as Myodes; also Craseomys, …)`."""
     text = name if rank == "scientific_name" else f"{rank} {name}"
-    found = synonyms.get((rank, name), ())
-    if found is None:
+    if synonyms is None:
+        return text
+    found = synonyms.of(rank, name)
+    if any(t.status == "unavailable" for t in found):
         return f"{text} (synonyms unavailable)"
-    if found:
-        return f"{text} (or its synonym{'s' if len(found) > 1 else ''} {', '.join(found)})"
-    return text
+    accepted = tuple(dict.fromkeys(t.accepted.name for t in found if t.accepted and t.status == "synonym"))
+    others = [n for n in synonyms.names(rank, name) if n not in accepted]
+    notes = [f"accepted as {' or '.join(accepted)}"] if accepted else []
+    if others:
+        notes.append(f"also {', '.join(others)}")
+    return f"{text} ({'; '.join(notes)})" if notes else text
 
 
 @dataclass(frozen=True)
@@ -161,7 +172,7 @@ class TaxonRow:
             yield self.rank, self.name
         yield from self.related
 
-    def describe(self, synonyms: Names) -> str:
+    def describe(self, synonyms: Synonymy | None) -> str:
         """This row in plain English, for `Search.description`."""
         text = _describe_taxon(self.rank, self.name, synonyms) if self.name else "any record"
         if self.relationships:
@@ -253,20 +264,27 @@ class Search:
     page: int
     cols: tuple[str, ...]
     """The columns asked for, unchecked: each engine knows its own columns."""
-    expand: bool = False
-    """The request asked for synonyms. The engine looks them up into `synonyms`."""
-    synonyms: Expansion = field(default_factory=Expansion)
+    synonyms: Synonymy | None = None
+    """What each taxon searched turned out to be, and the other names it also
+    matches. `None` when the query did not ask for synonyms."""
 
     @classmethod
-    def parse(cls, query: ArctosQuery, known: Collection[str]) -> "Search":
-        """`known` is the relationships the schema lists."""
+    def parse(cls, query: ArctosQuery, known: Collection[str], resolve: Resolve | None = None) -> "Search":
+        """`known` is the relationships the schema lists. A query asking for
+        synonyms has its taxa resolved by `resolve`; without one, every taxon is
+        searched alone and said to be unavailable."""
         tab = _one(query.tab)
         if tab is not None and tab not in known:
             msg = f"no relationship named `{tab}`"
             raise BadQueryError(msg)
         attrs = tuple(AttrRow.parse(raw) for raw in _present(query.attr))
+        taxa = tuple(TaxonRow.parse(raw, known) for raw in _present(query.taxon))
+        synonyms = None
+        if query.synonyms:
+            searched = [taxon for row in taxa for taxon in row.taxa()]
+            synonyms = resolve(searched) if resolve else Synonymy.unavailable(searched)
         return cls(
-            taxa=tuple(TaxonRow.parse(raw, known) for raw in _present(query.taxon)),
+            taxa=taxa,
             attrs=attrs,
             attr_op=query.attr_op,
             parts=tuple(AttrRow.parse_part(raw) for raw in _present(query.part)),
@@ -281,7 +299,7 @@ class Search:
             tab=tab,
             page=query.page or 1,
             cols=_present((query.cols or "").split(",")),
-            expand=query.synonyms,
+            synonyms=synonyms,
         )
 
     @property
@@ -290,7 +308,7 @@ class Search:
 
     def names(self, rank: str, name: str) -> tuple[str, ...]:
         """`name` and the synonyms it also matches at `rank`."""
-        return (name, *(self.synonyms.names.get((rank, name)) or ()))
+        return (name, *(self.synonyms.names(rank, name) if self.synonyms else ()))
 
     def relationships(self) -> tuple[str, ...]:
         """The relationships the rows name, deduplicated, in the order they were
@@ -306,7 +324,7 @@ class Search:
         """The taxon, attribute and part rows, each as a clause."""
         parts: list[str] = []
         if self.taxa:
-            parts.append(", or ".join(row.describe(self.synonyms.names) for row in self.taxa))
+            parts.append(", or ".join(row.describe(self.synonyms) for row in self.taxa))
         if self.attrs:
             rows = f" {self.attr_op} ".join(row.describe() for row in self.attrs)
             parts.append(f"with {rows}" + (f' by a method containing "{self.method}"' if self.method else ""))

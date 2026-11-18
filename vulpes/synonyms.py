@@ -13,14 +13,15 @@ import html
 import json
 import logging
 import re
-from collections.abc import Callable, Iterable, Mapping
+from collections.abc import Callable, Iterable
 from concurrent.futures import ThreadPoolExecutor
-from dataclasses import dataclass, field
 from functools import lru_cache
-from typing import Any, NamedTuple
+from typing import Any
 from urllib.error import URLError
 from urllib.parse import quote, urlencode
 from urllib.request import Request, urlopen
+
+from vulpes.models.responses import AcceptedName, Checklist, Synonymy, TaxonName, TaxonSynonymy
 
 logger = logging.getLogger(__name__)
 
@@ -44,49 +45,17 @@ Classification = tuple[tuple[str, str], ...]
 """`(rank, name)` pairs above the name, in the matcher's rank parameters:
 `kingdom`, `phylum`, `class`, `order`, `family`, `genus`…"""
 
-
-class Source(NamedTuple):
-    """A dataset on ChecklistBank."""
-
-    key: int
-    alias: str | None
-    title: str | None
-    version: str | None
-    doi: str | None
-    citation: str | None
-    """Plain text: ChecklistBank formats it as HTML."""
-
-
-class Synonym(NamedTuple):
-    name: str
-    source: Source | None
-    """The dataset the release took the name from. `None` for a name the
-    release's editors added themselves."""
-
-
-class SynonymsUnavailableError(Exception):
-    """ChecklistBank did not answer, or answered with something unreadable."""
-
-
-Names = Mapping[tuple[str, str], tuple[str, ...] | None]
-"""The other names each `(rank, name)` also matches. `None` says the lookup
-failed, and the name matches alone."""
-
-
-@dataclass(frozen=True)
-class Expansion:
-    """What the synonyms of one search's taxa came to."""
-
-    names: Names = field(default_factory=dict)
-    sources: tuple[tuple[Source, tuple[str, ...]], ...] = ()
-    """The release with every name added, then each dataset the release took
-    some of them from, with those names. Empty when no name was added."""
-
-
 Classify = Callable[[str, str], tuple[Classification, ...]]
 """The higher classifications a `(rank, lowercased name)` is filed under,
 most common first. A name filed under several, a homonym in the records
 themselves, is matched once under each."""
+
+Concept = tuple[AcceptedName, tuple[TaxonName, ...]]
+"""One taxon as the release has it: its accepted name, then its synonyms."""
+
+
+class SynonymsUnavailableError(Exception):
+    """ChecklistBank did not answer, or answered with something unreadable."""
 
 
 Fetch = Callable[[str], Any]
@@ -107,88 +76,109 @@ class Synonyms:
     def __init__(self, dataset: str = DEFAULT_DATASET, fetch: Fetch = _fetch) -> None:
         self._base = f"{API}/dataset/{quote(dataset, safe='')}"
         self._fetch = fetch
-        self.lookup = lru_cache(maxsize=CACHE_SIZE)(self._lookup)
-        self.dataset = lru_cache(maxsize=CACHE_SIZE)(self._dataset)
-        self._sector = lru_cache(maxsize=CACHE_SIZE)(self._sector_dataset)
+        self._lookup = lru_cache(maxsize=CACHE_SIZE)(self._lookup_uncached)
+        self._dataset = lru_cache(maxsize=CACHE_SIZE)(self._dataset_uncached)
+        self._sector = lru_cache(maxsize=CACHE_SIZE)(self._sector_uncached)
 
-    def expand(self, taxa: Iterable[tuple[str, str]], classify: Classify) -> Expansion:
-        """The synonyms of each `(rank, name)`, a rank id or `scientific_name`,
-        and the datasets they came from. A taxon whose lookup fails maps to
-        `None` and adds nothing."""
-        found = {taxon: self._synonyms_of(*taxon, classify) for taxon in dict.fromkeys(taxa)}
-        added = [n for synonyms in found.values() for n in synonyms or ()]
-        names = {taxon: None if s is None else tuple(n.name for n in s) for taxon, s in found.items()}
-        if not added:
-            return Expansion(names)
-        by_source: dict[Source, list[str]] = {self.release(): [n.name for n in added]}
-        for n in added:
-            if n.source is not None:
-                by_source.setdefault(n.source, []).append(n.name)
-        return Expansion(names, tuple((source, tuple(dict.fromkeys(ns))) for source, ns in by_source.items()))
+    def expand(self, taxa: Iterable[tuple[str, str]], classify: Classify) -> Synonymy:
+        """What each `(rank, name)`, a rank id or `scientific_name`, is in the
+        release, and the datasets its names came from."""
+        found = [t for taxon in dict.fromkeys(taxa) for t in self._match(*taxon, classify)]
+        matched = [t for t in found if t.accepted is not None]
+        if not matched:
+            return Synonymy(release=None, taxa=found, sources=[])
+        names = (n for t in matched for n in (t.accepted, *t.synonyms) if n is not None)
+        keys = dict.fromkeys(n.source for n in names if n.source is not None)
+        # Every one was fetched by the lookups, so these are cached.
+        return Synonymy(release=self._dataset(None), taxa=found, sources=[self._dataset(k) for k in keys])
 
-    def _synonyms_of(self, rank: str, name: str, classify: Classify) -> tuple[Synonym, ...] | None:
-        """The other names the taxon `name` names goes by. `None` when they
-        could not be looked up."""
+    def _match(self, rank: str, name: str, classify: Classify) -> list[TaxonSynonymy]:
+        """One entry per taxon `name` matches under the classifications the
+        records file it under."""
         key = " ".join(name.lower().split())
         classifications = classify(rank, key) or ((),)
         matcher_rank = None if rank == "scientific_name" else rank
         try:
             with ThreadPoolExecutor(max_workers=len(classifications)) as pool:
-                found = list(pool.map(lambda c: self.lookup(matcher_rank, key, c), classifications))
+                found = list(pool.map(lambda c: self._lookup(matcher_rank, key, c), classifications))
         except SynonymsUnavailableError as e:
             logger.warning("synonyms of %s %r unavailable: %s", rank, name, e)
-            return None
-        unique = {n.name: n for names in found for n in names if n.name.lower() != key}
-        return tuple(unique.values())
+            return [TaxonSynonymy(rank=rank, name=name, status="unavailable", accepted=None, synonyms=[])]
+        # Two classifications usually lead to the same taxon.
+        concepts = {c[0].name: c for c in found if c is not None}.values()
+        if not concepts:
+            return [TaxonSynonymy(rank=rank, name=name, status="unmatched", accepted=None, synonyms=[])]
+        return [
+            TaxonSynonymy(
+                rank=rank,
+                name=name,
+                status="accepted" if accepted.name.lower() == key else "synonym",
+                accepted=accepted,
+                synonyms=list(synonyms),
+            )
+            for accepted, synonyms in concepts
+        ]
 
-    def release(self) -> Source:
-        """The release synonyms are read from."""
-        return self.dataset(None)
-
-    def _dataset(self, key: int | None) -> Source:
-        """Dataset `key`, or the release for `None`. Use `dataset`, which caches this."""
+    def _dataset_uncached(self, key: int | None) -> Checklist:
+        """Dataset `key`, or the release for `None`."""
         d = self._fetch(self._base if key is None else f"{API}/dataset/{key}")
         citation = d.get("citation")
         if citation:
             citation = html.unescape(re.sub(r"<[^>]+>", "", citation)).strip()
-        return Source(d["key"], d.get("alias"), d.get("title"), d.get("version"), d.get("doi"), citation)
+        return Checklist(
+            key=d["key"],
+            alias=d.get("alias"),
+            title=d.get("title"),
+            version=d.get("version"),
+            doi=d.get("doi"),
+            citation=citation,
+        )
 
-    def _sector_dataset(self, sector: int) -> int:
-        """The dataset a sector of the release copies from."""
-        return int(self._fetch(f"{self._base}/sector/{sector}")["subjectDatasetKey"])
+    def _sector_uncached(self, sector: int) -> int:
+        """The dataset a sector of the release copies from, its metadata fetched
+        into the cache."""
+        key = int(self._fetch(f"{self._base}/sector/{sector}")["subjectDatasetKey"])
+        self._dataset(key)
+        return key
 
-    def _lookup(self, rank: str | None, name: str, classification: Classification = ()) -> tuple[Synonym, ...]:
-        """The accepted name of the taxon `name` matches, then its synonyms.
-        Empty when the matcher finds no single usage. Use `lookup`, which
-        caches this."""
+    def _lookup_uncached(self, rank: str | None, name: str, classification: Classification = ()) -> Concept | None:
+        """The taxon `name` matches, or `None` when the matcher finds no single usage."""
         params = {"scientificName": name, **dict(classification)}
         if rank:
             params["rank"] = rank
         found = self._fetch(f"{self._base}/match/nameusage?{urlencode(params)}")
         usage = found.get("usage")
         if not found.get("match") or not usage:
-            return ()
+            return None
 
-        # A synonym's parent is its accepted taxon, first in its classification.
-        if usage.get("status") in {"accepted", "provisionally accepted"}:
-            accepted = usage
-        else:
-            accepted = next((c for c in usage.get("classification") or () if c.get("id") == usage.get("parentId")), None)
-            if accepted is None:
-                return ()
-
-        synonyms = self._fetch(f"{self._base}/taxon/{quote(accepted['id'], safe='')}/synonyms")
-        sectors: dict[str, int | None] = {accepted["name"]: accepted.get("sectorKey")}
-        for group in _SYNONYM_GROUPS:
-            for u in synonyms.get(group) or ():
-                sectors.setdefault(u["name"]["scientificName"], u.get("sectorKey"))
+        # A synonym's parent is its accepted taxon.
+        accepted_id = usage["id"] if usage.get("status") in {"accepted", "provisionally accepted"} else usage.get("parentId")
+        if not accepted_id:
+            return None
+        info = self._fetch(f"{self._base}/taxon/{quote(accepted_id, safe='')}/info")
+        accepted = info["usage"]
+        references = info.get("references") or {}
+        cited = [c for r in accepted.get("referenceIds") or () if (c := (references.get(r) or {}).get("citation"))]
+        usages = [u for group in _SYNONYM_GROUPS for u in (info.get("synonyms") or {}).get(group) or ()]
 
         # Each source is two requests, and none waits on another. The release
         # is fetched here, where failing fails the lookup, so a search that
-        # found synonyms always has it to cite.
-        distinct = list(dict.fromkeys(k for k in sectors.values() if k is not None))
+        # found a taxon always has it to cite.
+        sectors = list(dict.fromkeys(u["sectorKey"] for u in (accepted, *usages) if u.get("sectorKey") is not None))
         with ThreadPoolExecutor(max_workers=MAX_PARALLEL) as pool:
-            release = pool.submit(self.release)
-            sources = dict(zip(distinct, pool.map(lambda k: self.dataset(self._sector(int(k))), distinct), strict=True))
+            release = pool.submit(self._dataset, None)
+            keys = dict(zip(sectors, pool.map(self._sector, sectors), strict=True))
             release.result()
-        return tuple(Synonym(n, None if k is None else sources[k]) for n, k in sectors.items())
+
+        def named(u: dict[str, Any]) -> dict[str, Any]:
+            n = u.get("name") or {}
+            link = n.get("link") or u.get("link")
+            return {
+                "name": n["scientificName"],
+                "authorship": n.get("authorship"),
+                "link": link,
+                "source": keys.get(u.get("sectorKey")),
+            }
+
+        synonyms = {s["name"]: TaxonName(**s) for s in map(named, usages)}
+        return AcceptedName(**named(accepted), references=cited), tuple(synonyms.values())

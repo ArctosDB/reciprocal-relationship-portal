@@ -12,31 +12,38 @@ import pytest
 
 from vulpes.engines.duckdb import DuckDbQueryEngine
 from vulpes.models.query import ArctosQuery
+from vulpes.models.responses import SearchSummary
 from vulpes.synonyms import Synonyms, SynonymsUnavailableError
 
 SHREW, SHREW_AGAIN, MOUSE, TICK, OTHER_SHREW = "MSB:Mamm:1", "MSB:Host:1", "MSB:Mamm:2", "MSB:Para:2", "DMNS:Mamm:1"
 
-MAMMAL_SOREX = {"id": "S", "name": "Sorex", "status": "accepted", "sectorKey": 1}
-INSECT_SOREX = {
-    "id": "B",
-    "name": "Sorex",
-    "status": "synonym",
-    "parentId": "I",
-    "classification": [{"id": "I", "name": "Ixodes"}],
-}
-PEROMYSCUS = {
-    "id": "P",
-    "name": "Peromyscus",
-    "status": "synonym",
-    "parentId": "S",
-    "classification": [{"id": "S", "name": "Sorex", "sectorKey": 1}],
+MATCHES = {
+    "mammal sorex": {"id": "S", "status": "accepted"},
+    "insect sorex": {"id": "B", "status": "synonym", "parentId": "I"},
+    "peromyscus": {"id": "P", "status": "synonym", "parentId": "S"},
 }
 
-SYNONYMS = {
+INFO = {
     "S": {
-        "heterotypic": [{"name": {"scientificName": "Peromyscus"}, "sectorKey": 2}, {"name": {"scientificName": "Neosorex"}}]
+        "usage": {
+            "id": "S",
+            "sectorKey": 1,
+            "referenceIds": ["r1", "gone"],
+            "name": {"scientificName": "Sorex", "authorship": "Linnaeus, 1758", "link": "https://mammals.example/sorex"},
+        },
+        "references": {"r1": {"citation": "Smith, A. (2005). Shrews of the world."}},
+        "synonyms": {
+            "heterotypic": [
+                {"sectorKey": 2, "name": {"scientificName": "Peromyscus", "authorship": "Gloger, 1841"}},
+                {"name": {"scientificName": "Neosorex"}},
+            ],
+            "misapplied": [{"name": {"scientificName": "Misused"}}],
+        },
     },
-    "I": {"heterotypic": [{"name": {"scientificName": "Sorex"}}]},
+    "I": {
+        "usage": {"id": "I", "name": {"scientificName": "Ixodes"}},
+        "synonyms": {"heterotypic": [{"name": {"scientificName": "Sorex"}}]},
+    },
 }
 
 SECTORS = {"1": 10, "2": 20}
@@ -54,10 +61,8 @@ DATASETS = {
 
 def match(name: str, hints: dict[str, str]) -> dict[str, Any] | None:
     if name == "sorex":
-        return MAMMAL_SOREX if hints.get("class") == "Mammalia" else INSECT_SOREX
-    if name == "peromyscus":
-        return PEROMYSCUS
-    return None
+        return MATCHES["mammal sorex" if hints.get("class") == "Mammalia" else "insect sorex"]
+    return MATCHES.get(name)
 
 
 class Fake:
@@ -74,8 +79,8 @@ class Fake:
             return {"subjectDatasetKey": SECTORS[path[-1]]}
         if path[-2] == "dataset":
             return DATASETS[path[-1]]
-        if parsed.path.endswith("/synonyms"):
-            return SYNONYMS.get(parsed.path.split("/")[-2], {})
+        if path[-1] == "info":
+            return INFO[path[-2]]
         params = {k: v[0] for k, v in parse_qs(parsed.query).items()}
         self.calls.append(params)
         usage = match(params["scientificName"].lower(), params)
@@ -98,8 +103,8 @@ def guids(engine: DuckDbQueryEngine, **params: Any) -> list[str]:  # noqa: ANN40
     return [r["guid"] for r in engine.search(ArctosQuery.model_validate(params)).records]
 
 
-def describe(engine: DuckDbQueryEngine, **params: Any) -> str | None:  # noqa: ANN401
-    return engine.summary(ArctosQuery.model_validate(params)).description
+def summary(engine: DuckDbQueryEngine, **params: Any) -> SearchSummary:  # noqa: ANN401
+    return engine.summary(ArctosQuery.model_validate(params))
 
 
 def test_synonyms_are_appended_only_when_asked(expanding: DuckDbQueryEngine) -> None:
@@ -122,16 +127,68 @@ def test_the_matcher_is_told_the_snapshot_s_classification(expanding: DuckDbQuer
     ]
 
 
-def test_a_synonym_reaches_its_accepted_name(expanding: DuckDbQueryEngine) -> None:
+def test_an_accepted_name_lists_its_synonyms(expanding: DuckDbQueryEngine) -> None:
+    assert summary(expanding, taxon=["genus|Sorex"], synonyms=True).description == "Genus Sorex (also Peromyscus, Neosorex)."
+
+
+def test_a_synonym_reaches_and_names_its_accepted_name(expanding: DuckDbQueryEngine) -> None:
     assert guids(expanding, taxon=["genus|peromyscus"], synonyms=True) == [OTHER_SHREW, SHREW_AGAIN, SHREW, MOUSE]
-    assert (
-        describe(expanding, taxon=["genus|Peromyscus"], synonyms=True) == "Genus Peromyscus (or its synonyms Sorex, Neosorex)."
-    )
+    found = summary(expanding, taxon=["genus|Peromyscus"], synonyms=True)
+    assert found.description == "Genus Peromyscus (accepted as Sorex; also Neosorex)."
+
+
+def test_the_summary_says_who_accepts_what_and_cites_them(expanding: DuckDbQueryEngine) -> None:
+    synonymy = summary(expanding, taxon=["genus|Peromyscus"], synonyms=True).synonyms
+    assert synonymy is not None
+    assert synonymy.model_dump() == {
+        "release": {
+            "key": 316691,
+            "alias": "COL26.10 XR",
+            "title": "Catalogue of Life",
+            "version": None,
+            "doi": None,
+            "citation": "COL & friends",
+        },
+        "taxa": [
+            {
+                "rank": "genus",
+                "name": "Peromyscus",
+                "status": "synonym",
+                # A reference id the release does not resolve is left out; misapplied names are not synonyms.
+                "accepted": {
+                    "name": "Sorex",
+                    "authorship": "Linnaeus, 1758",
+                    "link": "https://mammals.example/sorex",
+                    "source": 10,
+                    "references": ["Smith, A. (2005). Shrews of the world."],
+                },
+                "synonyms": [
+                    {"name": "Peromyscus", "authorship": "Gloger, 1841", "link": None, "source": 20},
+                    {"name": "Neosorex", "authorship": None, "link": None, "source": None},
+                ],
+            }
+        ],
+        "sources": [
+            {
+                "key": 10,
+                "alias": "Mammals",
+                "title": "Mammals of the world",
+                "version": None,
+                "doi": "10.1/m",
+                "citation": None,
+            },
+            {"key": 20, "alias": "Paper2020", "title": "A paper", "version": None, "doi": None, "citation": None},
+        ],
+    }
 
 
 def test_a_name_the_matcher_cannot_place_matches_alone(expanding: DuckDbQueryEngine) -> None:
     assert guids(expanding, taxon=["genus|Ixodes"], synonyms=True) == [TICK]
-    assert describe(expanding, taxon=["genus|Ixodes"], synonyms=True) == "Genus Ixodes."
+    found = summary(expanding, taxon=["genus|Ixodes"], synonyms=True)
+    assert found.description == "Genus Ixodes."
+    assert found.synonyms is not None
+    assert [(t.status, t.accepted) for t in found.synonyms.taxa] == [("unmatched", None)]
+    assert found.synonyms.release is None
 
 
 def test_a_lookup_is_cached(expanding: DuckDbQueryEngine, fake: Fake) -> None:
@@ -143,28 +200,22 @@ def test_a_lookup_is_cached(expanding: DuckDbQueryEngine, fake: Fake) -> None:
 def test_an_unreachable_catalogue_searches_the_name_alone_and_says_so(expanding: DuckDbQueryEngine, fake: Fake) -> None:
     fake.down = True
     assert guids(expanding, taxon=["genus|Peromyscus"], synonyms=True) == [MOUSE]
-    assert describe(expanding, taxon=["genus|Peromyscus"], synonyms=True) == "Genus Peromyscus (synonyms unavailable)."
+    found = summary(expanding, taxon=["genus|Peromyscus"], synonyms=True)
+    assert found.description == "Genus Peromyscus (synonyms unavailable)."
+    assert found.synonyms is not None
+    assert [t.status for t in found.synonyms.taxa] == ["unavailable"]
 
 
-def test_the_summary_lists_the_sources_of_the_synonyms_it_added(expanding: DuckDbQueryEngine) -> None:
-    summary = expanding.summary(ArctosQuery.model_validate({"taxon": ["genus|Peromyscus"], "synonyms": True}))
-    assert [(s.key, s.alias, s.citation, s.names) for s in summary.sources] == [
-        (316691, "COL26.10 XR", "COL & friends", ["Sorex", "Neosorex"]),
-        (10, "Mammals", None, ["Sorex"]),
-    ]
-
-
-def test_no_synonyms_no_sources(expanding: DuckDbQueryEngine, fake: Fake) -> None:
-    assert expanding.summary(ArctosQuery.model_validate({"taxon": ["genus|Peromyscus"]})).sources == []
-    fake.down = True
-    assert expanding.summary(ArctosQuery.model_validate({"taxon": ["genus|Peromyscus"], "synonyms": True})).sources == []
+def test_no_synonyms_asked_none_reported(expanding: DuckDbQueryEngine) -> None:
+    assert summary(expanding, taxon=["genus|Peromyscus"]).synonyms is None
 
 
 def test_a_name_filed_under_two_classifications_takes_the_synonyms_of_both(fake: Fake) -> None:
     mammal, insect = (("class", "Mammalia"),), (("class", "Insecta"),)
     expansion = Synonyms(fetch=fake).expand([("genus", "Sorex")], lambda _rank, _name: (mammal, insect))
-    assert expansion.names == {("genus", "Sorex"): ("Peromyscus", "Neosorex", "Ixodes")}
-    assert [(source.key, names) for source, names in expansion.sources] == [
-        (316691, ("Peromyscus", "Neosorex", "Ixodes")),
-        (20, ("Peromyscus",)),
+    assert expansion.names("genus", "Sorex") == ("Peromyscus", "Neosorex", "Ixodes")
+    assert [(t.status, t.accepted and t.accepted.name) for t in expansion.taxa] == [
+        ("accepted", "Sorex"),
+        ("synonym", "Ixodes"),
     ]
+    assert [s.key for s in expansion.sources] == [10, 20]

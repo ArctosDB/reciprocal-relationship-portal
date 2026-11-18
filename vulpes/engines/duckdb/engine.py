@@ -1,7 +1,5 @@
 import tempfile
-from collections import defaultdict
 from collections.abc import Callable, Iterator, Sequence
-from dataclasses import replace
 from datetime import UTC, date, datetime
 from functools import lru_cache
 from pathlib import Path
@@ -21,28 +19,21 @@ from vulpes.engines.duckdb.translate import (
     NESTED,
     RELATED_COLUMNS,
     Translator,
+    classifications,
     nested,
 )
 from vulpes.models.query import ArctosQuery
 from vulpes.models.responses import (
     AttrCount,
-    Distinct,
-    Facet,
-    Facets,
-    RelationStats,
     Schema,
     SearchResults,
     SearchSummary,
-    Stats,
     Summary,
-    SynonymSource,
     Taxon,
     Total,
-    TypedFacet,
-    Years,
 )
-from vulpes.models.search import DETECTION_FIELDS, RANK_COLUMNS, RANKS, BadQueryError, Rank, Search
-from vulpes.synonyms import Classification, Expansion, Synonyms
+from vulpes.models.search import DETECTION_FIELDS, BadQueryError, Search
+from vulpes.synonyms import Classification, Synonyms
 
 MAX_CLASSIFICATIONS = 3
 """The most classifications of one name matched, each one more request. Past
@@ -64,6 +55,8 @@ class DuckDbQueryEngine(QueryEngine):
         `code-tables` directory beside the database. `synonyms` answers a search
         asking for them; without it, such a search notes they are unavailable."""
         self._synonyms = synonyms
+        # The snapshot never changes while the process runs.
+        self._classifications = lru_cache(maxsize=4096)(self._classify)
         self.name = "duckdb"
         self.path = path
         # Read-only: the file is replaced whole by the importer, never written here.
@@ -99,32 +92,16 @@ class DuckDbQueryEngine(QueryEngine):
         return datetime.fromtimestamp(Path(self.path).stat().st_mtime, tz=UTC).date()
 
     def _parse(self, query: ArctosQuery) -> Search:
-        search = Search.parse(query, self.relationships)
-        if not search.expand:
-            return search
-        taxa = [taxon for row in search.taxa for taxon in row.taxa()]
-        if self._synonyms is None:
-            return replace(search, synonyms=Expansion(dict.fromkeys(taxa)))
-        return replace(search, synonyms=self._synonyms.expand(taxa, self._classifications))
+        synonyms = self._synonyms
+        resolve = None if synonyms is None else lambda taxa: synonyms.expand(taxa, self._classifications)
+        return Search.parse(query, self.relationships, resolve)
 
-    @lru_cache(maxsize=4096)  # noqa: B019 - the engine lives as long as the process
-    def _classifications(self, rank: str, name: str) -> tuple[Classification, ...]:
-        """The higher classifications the snapshot's records of `name`, lowercased,
-        carry at `rank`, most common first, as hints for ChecklistBank's matcher.
-        A scientific name counts the records whose name starts with it."""
-        if rank == "scientific_name":
-            above: tuple[Rank, ...] = RANKS[:-1]
-            where = "starts_with(lower(scientific_name), $name)"
-        else:
-            above = RANKS[: next(i for i, r in enumerate(RANKS) if r.id == rank)]
-            column = RANK_COLUMNS[rank]
-            where = f"list_contains(list_transform(string_split(lower({column}), ';'), lambda x: trim(x)), $name)"
+    def _classify(self, rank: str, name: str) -> tuple[Classification, ...]:
+        """The higher classifications the snapshot files `name`, lowercased, under
+        at `rank`, most common first, as hints for ChecklistBank's matcher."""
+        sql, above = classifications(rank, MAX_CLASSIFICATIONS)
         if not above:
             return ()
-        # A rank column joining several determinations offers its first.
-        picked = ", ".join(f"nullif(trim(split_part({r.column}, ';', 1)), '')" for r in above)
-        sql = f"""SELECT {picked} FROM records WHERE {where}
-            GROUP BY ALL ORDER BY count(*) DESC LIMIT {MAX_CLASSIFICATIONS}"""  # noqa: S608
         with self.conn.cursor() as cursor:
             rows = cursor.execute(sql, {"name": name}).fetchall()
         return tuple(tuple((r.id, v) for r, v in zip(above, row, strict=True) if v) for row in rows)
@@ -152,7 +129,7 @@ class DuckDbQueryEngine(QueryEngine):
         search = self._parse(query)
         related = search.tab is not None
         columns = self._columns(search, EXPORT_COLUMNS, related=related or search.constrains_relations)
-        sql = Translator(search)
+        sql = Translator(search, self.record_columns)
 
         with self.conn.cursor() as cursor:
             # Refused before any row moves, rather than cut short: a truncated
@@ -167,7 +144,7 @@ class DuckDbQueryEngine(QueryEngine):
             with tempfile.NamedTemporaryFile(prefix="arctos_", suffix=".csv", delete=False) as file:
                 path = Path(file.name)
             try:
-                cursor.execute(*sql.export(columns, self.record_columns, str(path), related=related))
+                cursor.execute(*sql.export(columns, str(path), related=related))
             except BaseException:
                 path.unlink(missing_ok=True)
                 raise
@@ -190,13 +167,11 @@ class DuckDbQueryEngine(QueryEngine):
     def relations(self, query: ArctosQuery) -> SearchResults:
         search = self._parse(query)
         columns = self._columns(search, DEFAULT_COLUMNS, related=True)
-        sql = Translator(search)
+        sql = Translator(search, self.record_columns)
 
         with self.conn.cursor() as cursor:
             specimens, reached = cursor.execute(*sql.picked_counts(related=True)).fetchall()[0]
-            flat = [c for c in columns if c in self.record_columns and c != "guid"]
-            locality = [c for c in columns if c in LOCALITY_COLUMNS]
-            records = self._records(cursor, columns, sql.related_page(flat, locality), None)
+            records = self._records(cursor, columns, sql.related_page(columns), None)
 
         return SearchResults(
             total=Total(value=reached, relation="eq"),
@@ -244,15 +219,13 @@ class DuckDbQueryEngine(QueryEngine):
     def search(self, query: ArctosQuery) -> SearchResults:
         search = self._parse(query)
         columns = self._columns(search, DEFAULT_COLUMNS, related=search.constrains_relations)
-        sql = Translator(search)
+        sql = Translator(search, self.record_columns)
 
         with self.conn.cursor() as cursor:
             taxon, context, matched, *per_row = cursor.execute(*sql.counts()).fetchall()[0]
 
-            flat = [c for c in columns if c in self.record_columns and c != "guid"]
-            locality = [c for c in columns if c in LOCALITY_COLUMNS]
             reached = sql.reached if search.constrains_relations else None
-            records = self._records(cursor, columns, sql.page(flat, locality), reached)
+            records = self._records(cursor, columns, sql.page(columns), reached)
 
         return SearchResults(
             # DuckDB counts exactly, so there is never a `gte`.
@@ -274,66 +247,15 @@ class DuckDbQueryEngine(QueryEngine):
     @override
     def summary(self, query: ArctosQuery) -> SearchSummary:
         search = self._parse(query)
+        sql = Translator(search, self.record_columns)
         with self.conn.cursor() as cursor:
-            rows = cursor.execute(*Translator(search).summary(self.categorical)).fetchall()
-
-        # One bucket of numbers per set: None for the matched records, else a relationship.
-        numbers: defaultdict[str | None, dict[str, int | None]] = defaultdict(dict)
-        facets: defaultdict[str | None, defaultdict[str, list[tuple[str | None, str, int]]]] = defaultdict(
-            lambda: defaultdict(list)
-        )
-        for grp, stat, kind, value, n in rows:
-            if value is None:
-                numbers[grp][stat] = n
-            else:
-                facets[grp][stat].append((kind, value, n))
-
-        def stats(grp: str | None) -> dict[str, Any]:
-            got, lists = numbers[grp], facets[grp]
-
-            def plain(name: str) -> list[Facet]:
-                top = sorted(lists[name], key=lambda f: (-f[2], f[1]))
-                return [Facet(value=value, count=n) for _, value, n in top]
-
-            def typed(name: str) -> list[TypedFacet]:
-                top = sorted(lists[name], key=lambda f: (-f[2], f[0] or "", f[1]))
-                return [TypedFacet(type=kind or "", value=value, count=n) for kind, value, n in top]
-
-            low, high = got.get("year_min"), got.get("year_max")
-            return {
-                "matched": got.get("matched") or 0,
-                "distinct": Distinct(
-                    taxa=got.get("taxa_distinct") or 0,
-                    localities=got.get("localities_distinct") or 0,
-                    collectors=got.get("collectors_distinct") or 0,
-                ),
-                "years": None if low is None or high is None else Years(min=low, max=high),
-                "facets": Facets(
-                    taxa=plain("taxa"),
-                    countries=plain("countries"),
-                    states=plain("states"),
-                    collections=plain("collections"),
-                    detections=typed("detections"),
-                    attributes=typed("attributes"),
-                    parts=typed("parts"),
-                ),
-            }
-
-        # The relationships the query names come first, in its order and present
-        # even when nothing was reached: the portal draws a tab for each. Then
-        # whatever a Related-taxon row reached without naming.
-        reached = {grp.lower(): grp for grp in numbers if grp is not None}
-        named = [reached.pop(kind.lower(), kind) for kind in search.relationships()]
-        related = [
-            RelationStats(relation=grp, pairings=numbers[grp].get("pairings") or 0, **stats(grp))
-            for grp in (*named, *sorted(reached.values()))
-        ]
-
+            rows = cursor.execute(*sql.summary(self.categorical)).fetchall()
+        records, related = sql.read_summary(rows)
         return SearchSummary(
-            records=Stats(**stats(None)),
+            records=records,
             related=related,
             description=search.description(),
-            sources=[SynonymSource(**source._asdict(), names=list(names)) for source, names in search.synonyms.sources],
+            synonyms=search.synonyms,
         )
 
     @override

@@ -32,10 +32,12 @@ names from this module's own tables are formatted in.
 # Every statement here is formatted SQL, for the reason above.
 
 import re
+from collections import defaultdict
 from collections.abc import Collection, Iterable, Sequence
 from typing import Any
 
-from vulpes.models.search import DETECTION_FIELDS, PER_PAGE, RANK_COLUMNS, AttrRow, Search, TaxonRow
+from vulpes.models.responses import Distinct, Facet, Facets, RelationStats, Stats, TypedFacet, Years
+from vulpes.models.search import DETECTION_FIELDS, PER_PAGE, RANK_COLUMNS, RANKS, AttrRow, Rank, Search, TaxonRow
 
 FACET_SIZE = 10
 """Each summary facet lists at most this many values."""
@@ -215,6 +217,37 @@ def nested(column: str, ids: str = _PAGE_IDS) -> str:
     return NESTED[column].replace("%IDS%", ids)
 
 
+def first_name(col: str) -> str:
+    """The first of the names a rank column joins with `;`, NULL when empty."""
+    return f"nullif(trim(split_part({col}, ';', 1)), '')"
+
+
+def _names_in(col: str, values: str) -> str:
+    """Whether the rank column `col` holds one of `values`, comma-separated
+    lowercased SQL values, among the names it joins with `;`."""
+    return (
+        f"(lower({col}) IN ({values}) OR (contains({col}, ';') AND list_has_any("
+        f"list_transform(string_split(lower({col}), ';'), lambda x: trim(x)), [{values}])))"
+    )
+
+
+def classifications(rank: str, limit: int) -> tuple[str, tuple[Rank, ...]]:
+    """The commonest `limit` higher classifications of the records naming
+    `$name`, lowercased, at `rank`, as one row of names per classification, and
+    the ranks those names are at. A scientific name counts the records whose
+    name starts with it. No ranks, and no statement, for the highest rank."""
+    above: tuple[Rank, ...]
+    if rank == "scientific_name":
+        above, where = RANKS[:-1], "starts_with(lower(scientific_name), $name)"
+    else:
+        above = RANKS[: next(i for i, r in enumerate(RANKS) if r.id == rank)]
+        where = _names_in(RANK_COLUMNS[rank], "$name")
+    if not above:
+        return "", ()
+    picked = ", ".join(first_name(r.column) for r in above)
+    return f"SELECT {picked} FROM records WHERE {where} GROUP BY ALL ORDER BY count(*) DESC LIMIT {limit}", above
+
+
 def _any(clauses: Sequence[str]) -> str:
     return clauses[0] if len(clauses) == 1 else "(" + " OR ".join(clauses) + ")"
 
@@ -228,8 +261,10 @@ class Translator:
     pairs a statement with the parameters it actually names, because DuckDB
     refuses a parameter the text does not use."""
 
-    def __init__(self, search: Search) -> None:
+    def __init__(self, search: Search, record_columns: Collection[str]) -> None:
+        """`record_columns` is the columns the `records` table has."""
         self.search = search
+        self._record_columns = record_columns
         self.params: dict[str, Any] = {}
 
         relation_rows = [row for row in search.taxa if row.constrains_relations]
@@ -278,12 +313,7 @@ class Translator:
         names = self.search.names(rank, name)
         if rank == "scientific_name":
             return _any([self._phrase(f"{alias}.scientific_name", n) for n in names])
-        col = f"{alias}.{RANK_COLUMNS[rank]}"
-        values = self._lowered(names)
-        return (
-            f"(lower({col}) IN ({values}) OR (contains({col}, ';') AND list_has_any("
-            f"list_transform(string_split(lower({col}), ';'), lambda x: trim(x)), [{values}])))"
-        )
+        return _names_in(f"{alias}.{RANK_COLUMNS[rank]}", self._lowered(names))
 
     def _related(self, rank: str, name: str) -> str:
         """A Related taxon, tested on one edge `e`."""
@@ -449,10 +479,19 @@ class Translator:
             FROM {source}
         """)
 
-    def page(self, record_columns: Collection[str], locality_columns: Collection[str]) -> tuple[str, dict[str, Any]]:
-        """One page of matched records in guid order, id first."""
-        select = ", ".join(f"r.{c}" for c in ("collection_object_id", "guid", "locality_id", *record_columns))
-        locality = "".join(f", l.{c}" for c in locality_columns)
+    def _flat(self, columns: Iterable[str]) -> list[str]:
+        """The columns read straight off `records`, `guid` aside: every query selects it."""
+        return [c for c in columns if c in self._record_columns and c != "guid"]
+
+    def _page_columns(self, columns: Sequence[str]) -> tuple[str, str]:
+        """The page's own select list, and the locality columns joined onto it."""
+        select = ", ".join(f"r.{c}" for c in ("collection_object_id", "guid", "locality_id", *self._flat(columns)))
+        return select, "".join(f", l.{c}" for c in columns if c in LOCALITY_COLUMNS)
+
+    def page(self, columns: Sequence[str]) -> tuple[str, dict[str, Any]]:
+        """One page of matched records in guid order, id first, holding the
+        flat and locality `columns`."""
+        select, locality = self._page_columns(columns)
         offset = (self.search.page - 1) * PER_PAGE
         page = f"""page AS (
                 SELECT {select} FROM records r
@@ -530,11 +569,11 @@ class Translator:
             SELECT (SELECT count(*) FROM hits), (SELECT count(*) FROM picked)
         """)
 
-    def related_page(self, record_columns: Collection[str], locality_columns: Collection[str]) -> tuple[str, dict[str, Any]]:
+    def related_page(self, columns: Sequence[str]) -> tuple[str, dict[str, Any]]:
         """One page of the related records in guid order, id first, each with
-        the matched records it was reached from."""
-        select = ", ".join(f"r.{c}" for c in ("collection_object_id", "guid", "locality_id", *record_columns))
-        locality = "".join(f", l.{c}" for c in locality_columns)
+        the matched records it was reached from, holding the flat and locality
+        `columns`."""
+        select, locality = self._page_columns(columns)
         offset = (self.search.page - 1) * PER_PAGE
         page = f"""page AS (
                 SELECT {select}, p.related_guid, p.related_scientific_name
@@ -548,9 +587,7 @@ class Translator:
             ORDER BY page.guid
         """)
 
-    def export(
-        self, columns: Sequence[str], record_columns: Collection[str], path: str, *, related: bool
-    ) -> tuple[str, dict[str, Any]]:
+    def export(self, columns: Sequence[str], path: str, *, related: bool) -> tuple[str, dict[str, Any]]:
         """Write every row of the table as CSV to `path`, in guid order, with
         `columns` as the header. DuckDB writes the file itself, which is several
         times quicker than moving the rows through Python.
@@ -558,9 +595,8 @@ class Translator:
         A nested column holds its JSON text and a related column its values
         joined with `"; "`, because a CSV cell holds one value.
         """
-        flat = [c for c in columns if c in record_columns and c != "guid"]
         out = f"""out AS MATERIALIZED (
-                SELECT p.*, r.guid, r.locality_id{"".join(f", r.{c}" for c in flat)}
+                SELECT p.*, r.guid, r.locality_id{"".join(f", r.{c}" for c in self._flat(columns))}
                 FROM picked p JOIN records r ON r.collection_object_id = p.id
             )"""
         ctes, joins, select = [out], [], []
@@ -681,3 +717,59 @@ class Translator:
             (SELECT * FROM facets
              QUALIFY row_number() OVER (PARTITION BY grp, stat ORDER BY n DESC, type, value) <= {FACET_SIZE})
         """)
+
+    def read_summary(self, rows: Iterable[tuple[Any, ...]]) -> tuple[Stats, list[RelationStats]]:
+        """The rows of `summary` as the matched records' statistics, then one
+        entry per relationship: those the query names first, in its order."""
+        # One bucket of numbers per set: None for the matched records, else a relationship.
+        numbers: defaultdict[str | None, dict[str, int | None]] = defaultdict(dict)
+        facets: defaultdict[str | None, defaultdict[str, list[tuple[str | None, str, int]]]] = defaultdict(
+            lambda: defaultdict(list)
+        )
+        for grp, stat, kind, value, n in rows:
+            if value is None:
+                numbers[grp][stat] = n
+            else:
+                facets[grp][stat].append((kind, value, n))
+
+        def stats(grp: str | None) -> dict[str, Any]:
+            got, lists = numbers[grp], facets[grp]
+
+            def plain(name: str) -> list[Facet]:
+                top = sorted(lists[name], key=lambda f: (-f[2], f[1]))
+                return [Facet(value=value, count=n) for _, value, n in top]
+
+            def typed(name: str) -> list[TypedFacet]:
+                top = sorted(lists[name], key=lambda f: (-f[2], f[0] or "", f[1]))
+                return [TypedFacet(type=kind or "", value=value, count=n) for kind, value, n in top]
+
+            low, high = got.get("year_min"), got.get("year_max")
+            return {
+                "matched": got.get("matched") or 0,
+                "distinct": Distinct(
+                    taxa=got.get("taxa_distinct") or 0,
+                    localities=got.get("localities_distinct") or 0,
+                    collectors=got.get("collectors_distinct") or 0,
+                ),
+                "years": None if low is None or high is None else Years(min=low, max=high),
+                "facets": Facets(
+                    taxa=plain("taxa"),
+                    countries=plain("countries"),
+                    states=plain("states"),
+                    collections=plain("collections"),
+                    detections=typed("detections"),
+                    attributes=typed("attributes"),
+                    parts=typed("parts"),
+                ),
+            }
+
+        # The relationships the query names come first, in its order and present
+        # even when nothing was reached: the portal draws a tab for each. Then
+        # whatever a Related-taxon row reached without naming.
+        reached = {grp.lower(): grp for grp in numbers if grp is not None}
+        named = [reached.pop(kind.lower(), kind) for kind in self.search.relationships()]
+        related = [
+            RelationStats(relation=grp, pairings=numbers[grp].get("pairings") or 0, **stats(grp))
+            for grp in (*named, *sorted(reached.values()))
+        ]
+        return Stats(**stats(None)), related

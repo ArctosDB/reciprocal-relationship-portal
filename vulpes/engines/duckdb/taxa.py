@@ -11,6 +11,7 @@ from itertools import pairwise
 
 import duckdb
 
+from vulpes.engines.duckdb.translate import first_name
 from vulpes.models.responses import Taxon
 from vulpes.models.search import RANKS, Rank
 
@@ -38,7 +39,7 @@ class TaxonIndex:
         branches = [
             f"""
             SELECT '{rank}', trim(x), count(*),
-                {f"'{above.id}', any_value(nullif(trim(split_part({above.column}, ';', 1)), ''))" if above else "NULL, NULL"}
+                {f"'{above.id}', any_value({first_name(above.column)})" if above else "NULL, NULL"}
             FROM (SELECT * FROM records WHERE {column} <> ''), unnest(string_split({column}, ';')) AS u(x)
             WHERE trim(x) <> '' GROUP BY ALL
             """  # noqa: S608 - the names are this module's own columns
