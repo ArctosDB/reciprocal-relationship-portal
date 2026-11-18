@@ -159,6 +159,8 @@ class Facets(ResponseModel):
     countries: list[Facet] = Field(default_factory=list)
     states: list[Facet] = Field(default_factory=list)
     collections: list[Facet] = Field(default_factory=list)
+    collectors: list[Facet] = Field(default_factory=list)
+    """Collector names, each exactly the `collector` filter's value for it."""
     detections: list[TypedFacet] = Field(default_factory=list)
     """The detection types: `detected`, `not detected`, `examined for` and
     `not examined for`."""

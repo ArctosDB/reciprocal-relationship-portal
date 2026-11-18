@@ -34,8 +34,8 @@ def test_observed_lists_carry_counts(engine: DuckDbQueryEngine) -> None:
     schema = engine.schema()
     assert [(f.value, f.count) for f in schema.countries] == [("United States", 5), ("Canada", 1)]
     assert [(f.value, f.count) for f in schema.states][:2] == [("Alaska", 2), ("New Mexico", 2)]
-    # The collector role only, by record.
-    assert [(f.value, f.count) for f in schema.collectors] == [("Joseph A. Cook", 2), ("Jane Doe", 1)]
+    # The collector role only, by record: Cook prepared the mouse and did not collect it.
+    assert [(f.value, f.count) for f in schema.collectors] == [("Jane Doe", 2), ("Joseph A. Cook", 2)]
     assert [(p.value, p.count, p.institution, p.collection_cde) for p in schema.guid_prefixes] == [
         ("MSB:Mamm", 2, "MSB", "Mammalogy"),
         ("MSB:Para", 2, "MSB", "Parasitology"),

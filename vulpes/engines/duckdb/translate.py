@@ -684,6 +684,12 @@ class Translator:
                 FROM specimen_events e JOIN sets s ON s.id = e.id
             ),
             -- every event of every record, plus the record's own dates for those with no event
+            -- every collector of every record, for their count and their facet
+            collected AS MATERIALIZED (
+                SELECT s.grp, ra.id, ra.agent_id
+                FROM record_agents ra JOIN sets s ON s.id = ra.id
+                WHERE ra.agent_role = 'collector'
+            ),
             dates AS (
                 SELECT grp, began_date, ended_date FROM events
                 UNION ALL
@@ -699,6 +705,12 @@ class Translator:
                 GROUP BY ALL
                 UNION ALL
                 {part_facets}
+                UNION ALL
+                -- by name, as `collector` matches, so one name is one bar
+                SELECT c.grp, 'collectors', NULL, ag.agent_name, count(DISTINCT c.id)
+                FROM collected c JOIN agents ag ON ag.agent_id = c.agent_id
+                WHERE ag.agent_name <> ''
+                GROUP BY ALL
             )
             SELECT grp, 'matched', NULL, NULL, count(*) FROM sets GROUP BY grp
             UNION ALL
@@ -706,8 +718,7 @@ class Translator:
             UNION ALL
             SELECT grp, 'localities_distinct', NULL, NULL, count(DISTINCT locality_id) FROM events GROUP BY grp
             UNION ALL
-            SELECT s.grp, 'collectors_distinct', NULL, NULL, count(DISTINCT ra.agent_id)
-            FROM record_agents ra JOIN sets s ON s.id = ra.id WHERE ra.agent_role = 'collector' GROUP BY s.grp
+            SELECT grp, 'collectors_distinct', NULL, NULL, count(DISTINCT agent_id) FROM collected GROUP BY grp
             UNION ALL
             SELECT grp, 'year_min', NULL, NULL, min({began}) FROM dates GROUP BY grp
             UNION ALL
@@ -757,6 +768,7 @@ class Translator:
                     countries=plain("countries"),
                     states=plain("states"),
                     collections=plain("collections"),
+                    collectors=plain("collectors"),
                     detections=typed("detections"),
                     attributes=typed("attributes"),
                     parts=typed("parts"),

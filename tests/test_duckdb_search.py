@@ -290,6 +290,13 @@ def test_the_summary_describes_the_whole_matched_set(engine: DuckDbQueryEngine) 
     assert [(f.value, f.count) for f in facets.taxa] == [("Sorex cinereus", 2), ("Peromyscus maniculatus", 1)]
     assert [(f.value, f.count) for f in facets.states] == [("Alaska", 1), ("Colorado", 1), ("New Mexico", 1)]
     assert [(f.value, f.count) for f in facets.collections] == [("MSB:Mamm", 2), ("MSB:Host", 1)]
+    # The collector role only, a record counting once under each of its collectors:
+    # Cook also prepared the mouse, and Doe co-collected the second shrew.
+    assert [(f.value, f.count) for f in facets.collectors] == [("Jane Doe", 2), ("Joseph A. Cook", 2)]
+    # Each name is what `collector` matches: picking it keeps exactly its records.
+    for f in facets.collectors:
+        picked = run(engine, taxon=["class|Mammalia"], prefix=["MSB:Mamm", "MSB:Host"], collector=f.value)
+        assert picked.total.value == f.count
     assert {(f.type, f.value, f.count) for f in facets.detections} == {
         ("detected", "endoparasite", 1),
         ("detected", "virus: Orthohantavirus", 1),

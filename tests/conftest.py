@@ -103,7 +103,8 @@ INSERT INTO agents VALUES (100, 'Joseph A. Cook'), (101, 'Jane Doe');
 
 CREATE TABLE record_agents (id BIGINT, agent_id BIGINT, agent_role VARCHAR, agent_order BIGINT, agent_remark VARCHAR);
 INSERT INTO record_agents (id, agent_id, agent_role) VALUES
-    (1, 100, 'collector'), (2, 100, 'collector'), (3, 101, 'collector'), (3, 100, 'preparator');
+    (1, 100, 'collector'), (2, 100, 'collector'), (2, 101, 'collector'), (3, 101, 'collector'),
+    (3, 100, 'preparator');
 
 CREATE TABLE related_records (
     src_id BIGINT, src_guid VARCHAR, src_prefix VARCHAR, relationship VARCHAR, identifier_type VARCHAR,
