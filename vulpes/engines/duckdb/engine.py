@@ -12,7 +12,6 @@ from vulpes.engines.duckdb.schema import build as build_schema
 from vulpes.engines.duckdb.taxa import TaxonIndex
 from vulpes.engines.duckdb.translate import (
     DEFAULT_COLUMNS,
-    EXPORT_COLUMNS,
     LOCALITY_COLUMNS,
     MAP_COLUMNS,
     MAP_PRESET,
@@ -130,7 +129,7 @@ class DuckDbQueryEngine(QueryEngine):
     def download(self, query: ArctosQuery) -> CSVStreamingResponse:
         search = self._parse(query)
         related = search.tab is not None
-        columns = self._columns(search, EXPORT_COLUMNS, related=related or search.constrains_relations)
+        columns = self._columns(search, DEFAULT_COLUMNS, related=related or search.constrains_relations)
         sql = Translator(search, self.record_columns)
 
         with self.conn.cursor() as cursor:

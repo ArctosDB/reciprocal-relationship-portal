@@ -148,16 +148,18 @@ def test_a_tab_exports_the_related_records(client: TestClient) -> None:
     ]
 
 
-def test_the_default_export_spreads_each_nested_column_over_lines_of_its_own(client: TestClient) -> None:
+def test_the_default_export_has_the_search_columns_each_nested_one_spread_over_lines(client: TestClient) -> None:
     header, *rows = table(client, taxon="genus|Peromyscus")
-    assert header[:6] == ["guid", "scientific_name", "country", "state_prov", "dec_lat", "dec_long"]
+    shown = client.get("/search", params={"taxon": "genus|Peromyscus"}).json()["column_order"]
+    assert list(dict.fromkeys(h.split(".")[0] for h in header)) == shown
     assert "related_guid" not in header
-    assert header[6:9] == [
+    assert header[header.index("attributedetail.attribute_type") :][:3] == [
         "attributedetail.attribute_type",
         "attributedetail.attribute_value",
         "attributedetail.attribute_units",
     ]
     assert "relations.related_guid" in header
+    assert "partdetail.part_attributes.attribute_value" in header
     by_name = [dict(zip(header, row, strict=True)) for row in rows]
     assert [r["guid"] for r in by_name] == [MOUSE, "", ""]
     assert [r["scientific_name"] for r in by_name] == ["Peromyscus maniculatus", "", ""]

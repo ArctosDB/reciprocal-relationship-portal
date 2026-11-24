@@ -173,19 +173,6 @@ LOCALITY_COLUMNS = (
 )
 """Columns of the record's primary locality, which live on `localities`."""
 
-EXPORT_COLUMNS = (
-    "guid",
-    "scientific_name",
-    "country",
-    "state_prov",
-    "dec_lat",
-    "dec_long",
-    "attributedetail",
-    "relations",
-)
-"""The columns of a download that names none. Not every column: the column
-count sets the cost of an export."""
-
 MAP_COLUMNS = (
     "guid",
     "scientific_name",
