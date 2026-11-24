@@ -34,7 +34,10 @@ names from this module's own tables are formatted in.
 import re
 from collections import defaultdict
 from collections.abc import Collection, Iterable, Sequence
-from typing import Any
+from typing import Any, cast
+
+import duckdb
+from duckdb.sqltypes import DuckDBPyType
 
 from vulpes.models.responses import Distinct, Facet, Facets, RelationStats, Stats, TypedFacet, Years
 from vulpes.models.search import DETECTION_FIELDS, PER_PAGE, RANK_COLUMNS, RANKS, AttrRow, Rank, Search, TaxonRow
@@ -209,6 +212,70 @@ DEFAULT_COLUMNS = (
     "attributedetail",
     "partdetail",
 )
+
+
+Layout = tuple[tuple[str, "Layout | None"], ...]
+"""The fields of a nested column's elements, in order, each with the layout of
+its own elements when it is itself a list of records, as `partdetail`'s
+`part_attributes` are."""
+
+
+def headers(layout: Layout, prefix: str) -> list[str]:
+    """The export's columns for a nested column laid out as `layout`: each field
+    named by its path, `partdetail.part_attributes.attribute_type`."""
+    names = []
+    for name, sub in layout:
+        names += [f"{prefix}{name}"] if sub is None else headers(sub, f"{prefix}{name}.")
+    return names
+
+
+def _flatten(value: str, layout: Layout, prefix: str, depth: int = 0) -> str:
+    e, i = f"e{depth}", f"i{depth}"
+    inner = [(name, sub) for name, sub in layout if sub is not None]
+    if not inner:
+        flat = ", ".join(f"{_key(prefix + name)}: {e}.{_ident(name)}" for name, _ in layout)
+        return f"list_transform({value}, lambda {e}: {{{flat}}})"
+    lists = {name: f"l{depth}_{n}" for n, (name, _) in enumerate(inner)}
+    packed = ", ".join(
+        [f"{e} := {e}"]
+        + [f"{lists[name]} := {_flatten(f'{e}.{_ident(name)}', sub, f'{prefix}{name}.', depth + 1)}" for name, sub in inner]
+    )
+    span = f"greatest(1, {', '.join(f'coalesce(len({e}.{lists[name]}), 0)' for name, _ in inner)})"
+    fields = []
+    for name, sub in layout:
+        if sub is None:
+            fields.append(f"{_key(prefix + name)}: CASE WHEN {i} = 0 THEN {e}.{e}.{_ident(name)} END")
+        else:
+            fields += [f"{_key(h)}: {e}.{lists[name]}[{i} + 1].{_ident(h)}" for h in headers(sub, f"{prefix}{name}.")]
+    rows = f"list_transform(range({span}), lambda {i}: {{{', '.join(fields)}}})"
+    return f"flatten(list_transform(list_transform({value}, lambda {e}: struct_pack({packed})), lambda {e}: {rows}))"
+
+
+def layout(kind: DuckDBPyType) -> Layout | None:
+    """The layout of a nested column of type `kind`, None when it is not a list of records."""
+    if kind.id != "list" or kind.child.id != "struct":
+        return None
+    return tuple((name, layout(cast("DuckDBPyType", child))) for name, child in kind.child.children)
+
+
+def layouts(cursor: duckdb.DuckDBPyConnection) -> dict[str, Layout]:
+    found = {}
+    for column in NESTED:
+        kind = cursor.sql(nested(column, "SELECT NULL::BIGINT WHERE FALSE")).types[1]
+        shape = layout(kind)
+        if shape is None:
+            msg = f"the nested column `{column}` is a {kind}, not a list of records"
+            raise TypeError(msg)
+        found[column] = shape
+    return found
+
+
+def _ident(name: str) -> str:
+    return '"' + name.replace('"', '""') + '"'
+
+
+def _key(name: str) -> str:
+    return "'" + name.replace("'", "''") + "'"
 
 
 def nested(column: str, ids: str = _PAGE_IDS) -> str:
@@ -587,39 +654,50 @@ class Translator:
             ORDER BY page.guid
         """)
 
-    def export(self, columns: Sequence[str], path: str, *, related: bool) -> tuple[str, dict[str, Any]]:
-        """Write every row of the table as CSV to `path`, in guid order, with
-        `columns` as the header. DuckDB writes the file itself, which is several
-        times quicker than moving the rows through Python.
+    def export(
+        self, columns: Sequence[str], path: str, layouts: dict[str, Layout], *, related: bool
+    ) -> tuple[str, dict[str, Any]]:
+        """Write every row of the table as CSV to `path`, in guid order.
 
-        A nested column holds its JSON text and a related column its values
-        joined with `"; "`, because a CSV cell holds one value.
+        A nested column is spread over the columns `headers` names for its
+        layout in `layouts`, and a record over as many lines as its longest
+        nested column has rows. The record's own columns fill its first line
+        and are blank on the rest, so a new guid starts a new record. The
+        nested columns sit side by side: the third attribute and the third
+        relation share a line and nothing else. A related column holds its
+        values joined with `"; "`.
         """
         out = f"""out AS MATERIALIZED (
                 SELECT p.*, r.guid, r.locality_id{"".join(f", r.{c}" for c in self._flat(columns))}
                 FROM picked p JOIN records r ON r.collection_object_id = p.id
             )"""
-        ctes, joins, select = [out], [], []
+        ctes, joins, inner, outer, spans = [out], [], ["out.guid AS _guid"], [], []
         for column in columns:
             if column in NESTED:
-                ctes.append(f"n_{column}(id, v) AS ({nested(column, 'SELECT id FROM out')})")
+                flat, query = _flatten("n.v", layouts[column], f"{column}."), nested(column, "SELECT id FROM out")
+                ctes.append(f"n_{column}(id, v) AS (SELECT n.id, {flat} FROM ({query}) n(id, v))")
                 joins.append(f"LEFT JOIN n_{column} ON n_{column}.id = out.id")
-                select.append(f"to_json(n_{column}.v) AS {column}")
-            elif column in LOCALITY_COLUMNS:
-                select.append(f"l.{column}")
+                inner.append(f"n_{column}.v AS n_{column}")
+                spans.append(f"coalesce(len(n_{column}.v), 0)")
+                outer += [f"n_{column}[_row + 1].{_ident(h)} AS {_ident(h)}" for h in headers(layouts[column], f"{column}.")]
+                continue
+            if column in LOCALITY_COLUMNS:
+                inner.append(f"l.{column}")
             elif column in RELATED_COLUMNS:
-                select.append(f"array_to_string(out.{column}, '; ') AS {column}")
+                inner.append(f"array_to_string(out.{column}, '; ') AS {column}")
             else:
-                select.append(f"out.{column}")
+                inner.append(f"out.{column}")
+            outer.append(f"CASE WHEN _row = 0 THEN {column} END AS {column}")
         if any(c in LOCALITY_COLUMNS for c in columns):
             joins.append("LEFT JOIN localities l ON l.locality_id = out.locality_id")
+        inner.append(f"unnest(range(greatest(1, {', '.join(spans)}))) AS _row" if spans else "0 AS _row")
         target = path.replace("'", "''")
         return self.statement(f"""
             COPY (
                 {self._with(*self._picked(related=related), *ctes)}
-                SELECT {", ".join(select)}
-                FROM out {" ".join(joins)}
-                ORDER BY out.guid
+                SELECT {", ".join(outer)}
+                FROM (SELECT {", ".join(inner)} FROM out {" ".join(joins)})
+                ORDER BY _guid, _row
             ) TO '{target}' (FORMAT csv, HEADER)
         """)
 

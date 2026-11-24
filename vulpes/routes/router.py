@@ -47,8 +47,6 @@ def make_router(engine: QueryEngine) -> APIRouter:
     @router.get("/search")
     def search(response: Response, query: Annotated[ArctosQuery, Query()]) -> SearchResults:
         response.headers["Cache-Control"] = SEARCH_CACHE
-        # To record a request detail on the trace, set an attribute on
-        # opentelemetry's current span here, for example `arctos.page`.
         with tracer.start_as_current_span(f"{engine.name}.search"):
             return engine.search(query)
 

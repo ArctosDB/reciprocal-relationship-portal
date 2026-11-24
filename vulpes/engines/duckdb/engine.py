@@ -20,6 +20,7 @@ from vulpes.engines.duckdb.translate import (
     RELATED_COLUMNS,
     Translator,
     classifications,
+    layouts,
     nested,
 )
 from vulpes.models.query import ArctosQuery
@@ -75,6 +76,7 @@ class DuckDbQueryEngine(QueryEngine):
             )
 
             self._taxa = TaxonIndex(cursor)
+            self._layouts = layouts(cursor)
 
         self.relationships: frozenset[str] = frozenset(r.value for r in self._schema.relations)
         # The summary facets attribute values only for the types that have a
@@ -144,7 +146,7 @@ class DuckDbQueryEngine(QueryEngine):
             with tempfile.NamedTemporaryFile(prefix="arctos_", suffix=".csv", delete=False) as file:
                 path = Path(file.name)
             try:
-                cursor.execute(*sql.export(columns, str(path), related=related))
+                cursor.execute(*sql.export(columns, str(path), self._layouts, related=related))
             except BaseException:
                 path.unlink(missing_ok=True)
                 raise
@@ -195,7 +197,6 @@ class DuckDbQueryEngine(QueryEngine):
         rows = [dict(zip(names, row, strict=True)) for row in result.fetchall()]
         ids = [row.pop("collection_object_id") for row in rows]
 
-        # Each nested column is one more statement over the page's ids.
         lookups: dict[str, dict[int, Any]] = {}
         if ids:
             for column in columns:
@@ -211,7 +212,6 @@ class DuckDbQueryEngine(QueryEngine):
         for record_id, row in zip(ids, rows, strict=True):
             for column, by_id in lookups.items():
                 row[column] = _compact(by_id.get(record_id))
-            # A record holds only the fields it has a value for, in display order.
             records.append({c: row[c] for c in columns if row.get(c) is not None})
         return records
 

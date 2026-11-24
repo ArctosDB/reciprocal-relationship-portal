@@ -86,7 +86,6 @@ def test_parasites(cursor):
     assert rows
     for r in rows:
         assert r["host_guid"].startswith("MSB:Mamm:")
-        # the joined record is the one the edge points at
         assert r["guid"] == r["dst_guid"]
         assert r["guid_prefix"] == r["dst_prefix"]
 
@@ -131,7 +130,6 @@ def test_part_attribute(cursor):
         assert r["attribute_value"] == "postcranial"
         assert r["guid_prefix"] == "MSB:Mamm"
         assert r["part_name"]
-        # the part belongs to the record it was joined to
         assert r["part_owner_id"] == r["collection_object_id"]
 
 

@@ -3,17 +3,18 @@
 
 import csv
 import io
-import json
 import re
 import tempfile
 from pathlib import Path
 from typing import Any
 
+import duckdb
 import pytest
 from fastapi import FastAPI
 from fastapi.testclient import TestClient
 
 from vulpes.engines.duckdb import DuckDbQueryEngine
+from vulpes.engines.duckdb.translate import Layout, _flatten, headers
 from vulpes.models.query import ArctosQuery
 from vulpes.models.responses import SearchResults
 from vulpes.models.search import BadQueryError
@@ -147,22 +148,47 @@ def test_a_tab_exports_the_related_records(client: TestClient) -> None:
     ]
 
 
-def test_the_default_export_carries_nested_columns_as_json(client: TestClient) -> None:
-    header, row = table(client, taxon="genus|Peromyscus")
-    # No relation was asked for, so there is no `related_guid` column.
-    assert header == [
-        "guid",
-        "scientific_name",
-        "country",
-        "state_prov",
-        "dec_lat",
-        "dec_long",
-        "attributedetail",
-        "relations",
+def test_the_default_export_spreads_each_nested_column_over_lines_of_its_own(client: TestClient) -> None:
+    header, *rows = table(client, taxon="genus|Peromyscus")
+    assert header[:6] == ["guid", "scientific_name", "country", "state_prov", "dec_lat", "dec_long"]
+    assert "related_guid" not in header
+    assert header[6:9] == [
+        "attributedetail.attribute_type",
+        "attributedetail.attribute_value",
+        "attributedetail.attribute_units",
     ]
-    assert row[:6] == [MOUSE, "Peromyscus maniculatus", "United States", "Alaska", "64.8", "-147.7"]
-    assert {a["attribute_type"] for a in json.loads(row[6])} == {"detected", "sex", "weight"}
-    assert {link["relationship"] for link in json.loads(row[7])} == {"host of parasite", "ate"}
+    assert "relations.related_guid" in header
+    by_name = [dict(zip(header, row, strict=True)) for row in rows]
+    assert [r["guid"] for r in by_name] == [MOUSE, "", ""]
+    assert [r["scientific_name"] for r in by_name] == ["Peromyscus maniculatus", "", ""]
+    assert [r["attributedetail.attribute_type"] for r in by_name] == ["detected", "sex", "weight"]
+    assert [r["attributedetail.attribute_units"] for r in by_name] == ["", "", "g"]
+    assert [r["relations.relationship"] for r in by_name] == ["ate", "host of parasite", ""]
+    assert [r["relations.related_guid"] for r in by_name] == ["", TICK, ""]
+
+
+def test_a_nested_column_within_a_nested_column_is_spread_out_too(client: TestClient) -> None:
+    header, *rows = table(client, prefix="MSB:Mamm", cols="guid,partdetail")
+    assert "partdetail.part_attributes.attribute_value" in header
+    assert "partdetail.part_attributes" not in header
+    picked = [
+        (r["guid"], r["partdetail.part_name"], r["partdetail.part_attributes.attribute_value"])
+        for r in (dict(zip(header, row, strict=True)) for row in rows)
+    ]
+    assert picked == [(SHREW, "liver", "frozen"), (MOUSE, "liver", ""), ("", "skull", "")]
+    assert table(client, prefix="MSB:Host", cols="guid,partdetail")[1:] == [[SHREW_AGAIN] + [""] * (len(header) - 1)]
+
+
+def test_an_element_spans_as_many_lines_as_its_longest_list() -> None:
+    layout: Layout = (("name", None), ("kids", (("x", None),)), ("pets", (("y", None),)))
+    value = "[{'name': 'a', 'kids': [{'x': 1}, {'x': 2}], 'pets': [{'y': 3}]}, {'name': 'b', 'kids': NULL, 'pets': []}]"
+    [(lines,)] = duckdb.connect().execute(f"SELECT {_flatten(value, layout, 'p.')}").fetchall()
+    assert headers(layout, "p.") == ["p.name", "p.kids.x", "p.pets.y"]
+    assert lines == [
+        {"p.name": "a", "p.kids.x": 1, "p.pets.y": 3},
+        {"p.name": None, "p.kids.x": 2, "p.pets.y": None},
+        {"p.name": "b", "p.kids.x": None, "p.pets.y": None},
+    ]
 
 
 def test_cols_names_the_columns_of_the_export(client: TestClient) -> None:
